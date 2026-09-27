@@ -82,6 +82,18 @@ its context lines are upstream b43 code under that file's license.
 | `README.md`, `docs/*.md` | new | GPL-2.0-only |
 | `LICENSES/*` | FSF license texts | verbatim, unmodified |
 
+## Image assets
+
+Image-specific copyright, attribution and licensing information is
+documented in [images/README.md](images/README.md).
+
+Original project photographs and the validation screenshot are project
+documentation assets.
+
+The external ASUS RT-AC68U photograph is a derivative of a Wikimedia
+Commons image licensed under CC BY-SA 2.0. That image retains its
+Creative Commons license and is not relicensed under GPL-2.0-only.
+
 ## Not included
 
 - **Hardware data** (chip/radio and board data packages): not part of

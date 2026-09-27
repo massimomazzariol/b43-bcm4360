@@ -25,7 +25,7 @@ wireless information elements.
 The supported path is intentionally **receive-only**. Transmission,
 association and 5 GHz operation remain disabled.
 
-<img width="1122" height="1080" alt="rt-ac68u-router" src="https://github.com/user-attachments/assets/ecc82944-cf63-4fd0-84dc-831191fb067e" />
+<img width="1122" height="1080" alt="rt-ac68u-router" src="docs/images/rt-ac68u-router.jpg" />
 
 <p align="center">
   <em>ASUS RT-AC68U — the hardware platform used for development and validation.</em>
@@ -56,7 +56,7 @@ association and 5 GHz operation remain disabled.
 The driver was developed and validated against a physical ASUS RT-AC68U
 rather than an emulated wireless device.
 
-<img width="731" height="1005" alt="rt-ac68u-testbench" src="https://github.com/user-attachments/assets/1263c0c9-f5f7-4780-8fbd-8e6d1a83ec74" />
+<img width="731" height="1005" alt="rt-ac68u-testbench" src="docs/images/rt-ac68u-testbench.jpg" />
 
 <p align="center">
   <em>RT-AC68U development board during hardware testing.</em>
@@ -66,14 +66,14 @@ rather than an emulated wireless device.
 <tr>
 <td width="50%" align="center">
 
-<img width="2000" height="924" alt="rt-ac68u-board" src="https://github.com/user-attachments/assets/6ea52e20-a0e8-4c22-919c-4696bba0dff6" />
+<img width="2000" height="924" alt="rt-ac68u-board" src="docs/images/rt-ac68u-board.jpg" />
 
 <strong>RT-AC68U main board</strong>
 
 </td>
 <td width="50%" align="center">
 
-<img width="2000" height="924" alt="rt-ac68u-revision" src="https://github.com/user-attachments/assets/efa83049-0776-400c-a144-8d3165f25c13" />
+<img width="2000" height="924" alt="rt-ac68u-revision" src="docs/images/rt-ac68u-revision.jpg" />
 
 <strong>Hardware revision marking</strong>
 
@@ -218,7 +218,7 @@ iw dev wlan0 scan passive
 Example from the validated hardware:
 
 <p align="center">
-<img width="854" height="2019" alt="validation-pass" src="https://github.com/user-attachments/assets/3a790e4c-f8ca-45b1-a38b-ace3d9df7c12" />
+<img width="854" height="2019" alt="validation-pass" src="docs/images/validation-pass.png" />
 </p>
 
 <p align="center">
