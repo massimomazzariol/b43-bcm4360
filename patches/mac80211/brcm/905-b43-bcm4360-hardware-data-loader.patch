@@ -1,0 +1,537 @@
+From: Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
+Subject: [PATCH] b43: load the BCM4360 hardware data packages
+
+Provide the BCM4360 data sets from two data packages in the firmware
+search path: b43/bcm4360-ac1-2069r4.bin (chip/radio) and the board
+package named by the board profile.  Both are loaded once, validated
+completely (identity, size, CRC-32, section layout and shape) and
+converted into the in-memory data sets.  A missing or invalid package
+rejects the device before the PMU, PHY or radio are touched; there is
+no fallback to partial or default data.  The packages are not part of
+the source tree.
+---
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/bcm4360_data_fw.c
+@@ -0,0 +1,522 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Broadcom B43 wireless driver
++ * BCM4360 hardware data packages
++ *
++ * Copyright (c) 2026 Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
++ *
++ * The BCM4360 receive path needs chip/radio and board-specific hardware
++ * data that is not part of the driver source.  It is supplied as two data
++ * packages in the firmware search path:
++ *
++ *   B43_BCM4360_CHIP_DATA_FILE   chip/radio (BCM4360, AC-PHY rev 1,
++ *                                BCM2069 rev 4)
++ *   board->data_file             one board profile
++ *
++ * Both are loaded once, validated completely and converted into the
++ * in-memory data sets of bcm4360.h.  A missing or invalid package rejects
++ * the device; there is no fallback to partial or default data.
++ *
++ * Package format (ABI version 1, all fields little-endian):
++ *
++ *   header, 32 bytes:
++ *     0  magic "B43D"          16  total_len (u32, = file size)
++ *     4  abi_version (u16) = 1 20  crc32 (u32) of bytes 24..end
++ *     6  kind (u16)            24  board tag (8 bytes, NUL padded;
++ *     8  chip_id (u16)             all zero in a chip/radio package)
++ *    10  phy_type (u8), 11 phy_rev (u8)
++ *    12  radio_ver (u16), 14 radio_rev (u8), 15 n_sections (u8)
++ *
++ *   section table, n_sections x 16 bytes:
++ *     0 id (u16), 2 flags (u16, bit 0 = mandatory), 4 elem_bits (u8:
++ *     8/16/32), 5 reserved (3 bytes, zero), 8 offset (u32, 4-byte aligned),
++ *     12 count (u32, elements)
++ *
++ * Section contents are described next to the section ids below.
++ */
++
++#include <linux/crc32.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/firmware.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "bcm4360.h"
++
++#define B43_BDATA_MAGIC			"B43D"
++#define B43_BDATA_ABI_VERSION		1
++#define B43_BDATA_KIND_CHIP		1
++#define B43_BDATA_KIND_BOARD		2
++#define B43_BDATA_HDR_LEN		32
++#define B43_BDATA_CRC_START		24
++#define B43_BDATA_TAG_LEN		8
++#define B43_BDATA_SECT_LEN		16
++#define B43_BDATA_MAX_SECTIONS		32
++#define B43_BDATA_SECT_MANDATORY	0x0001
++#define B43_BDATA_PHY_TYPE_AC		11
++
++/*
++ * Chip/radio package sections.
++ *
++ * RFSEQ7: records { offset, count, data[count] } written to PHY table 7.
++ * PREFREGS: { radio register, value } pairs.
++ * CHAN_2G: 14 rows of B43_BCM2069_REV4_CHAN_WORDS words, channels 1..14.
++ * FARROW_2G: 14 { deltaphase_lo, deltaphase_hi } pairs.
++ * PHASETRACK: PHY table 0x05, written once before the first channel set.
++ * RX_GAIN_TABLES: the byte arrays of struct b43_bcm4360_rx_gain_tables in
++ *   declaration order.
++ * RX_EVM: lo[3], hi[3] of struct b43_bcm4360_rx_evm (optional).
++ */
++#define B43_BDATA_RFSEQ7		0x0101
++#define B43_BDATA_PREFREGS		0x0102
++#define B43_BDATA_CHAN_2G		0x0103
++#define B43_BDATA_FARROW_2G		0x0104
++#define B43_BDATA_PHASETRACK		0x0105
++#define B43_BDATA_RX_GAIN_TABLES	0x0106
++#define B43_BDATA_RX_EVM		0x0107
++
++/*
++ * Board package sections.
++ *
++ * FEM_LUT: 32 entries per receive core (PHY table 0x0a).
++ * RX_GAIN: elna_gain_db, trloss_db, gain_code_a[5], gain_code_b[5],
++ *   rfseq_init_gain (13 words).
++ */
++#define B43_BDATA_FEM_LUT		0x0201
++#define B43_BDATA_RX_GAIN		0x0202
++
++#define B43_BCM4360_N_CHAN_2G		14
++#define B43_BCM4360_PHASETRACK_LEN	22
++#define B43_BCM4360_MAX_RFSEQ7		16
++#define B43_BCM4360_MAX_RFSEQ7_WORDS	256
++#define B43_BCM4360_MAX_PREFREGS	64
++#define B43_BCM4360_MAX_FEM_CORES	4
++#define B43_BCM4360_RX_GAIN_WORDS	13
++
++struct b43_bcm4360_chip_pkg {
++	struct b43_bcm4360_data data;
++	struct b43_phy_ac_tbl init_tables[1];
++	u32 phasetrack[B43_BCM4360_PHASETRACK_LEN];
++	struct b43_phy_ac_tbl rfseq7[B43_BCM4360_MAX_RFSEQ7];
++	u16 rfseq7_words[B43_BCM4360_MAX_RFSEQ7_WORDS];
++	struct b43_bcm2069_reg_value prefregs[B43_BCM4360_MAX_PREFREGS];
++	u16 chan_2g[B43_BCM4360_N_CHAN_2G][B43_BCM2069_REV4_CHAN_WORDS];
++	struct b43_bcm4360_farrow farrow_2g[B43_BCM4360_N_CHAN_2G];
++	struct b43_bcm4360_rx_gain_tables rx_gain_tables;
++	struct b43_bcm4360_rx_evm rx_evm;
++};
++
++struct b43_bcm4360_board_pkg {
++	const struct b43_bcm4360_board *board;
++	struct b43_bcm4360_board_data data;
++	u8 fem_lut[B43_BCM4360_MAX_FEM_CORES][32];
++	struct b43_bcm4360_rx_gain rx_gain;
++};
++
++struct b43_bdata_sect {
++	u16 id;
++	u16 flags;
++	u8 elem_bits;
++	u32 offset;
++	u32 count;
++	const u8 *p;
++};
++
++struct b43_bdata {
++	unsigned int n;
++	struct b43_bdata_sect sect[B43_BDATA_MAX_SECTIONS];
++};
++
++static DEFINE_MUTEX(b43_bcm4360_data_mutex);
++static struct b43_bcm4360_chip_pkg *b43_bcm4360_chip_pkg;
++static struct b43_bcm4360_board_pkg *b43_bcm4360_board_pkg;
++
++MODULE_FIRMWARE(B43_BCM4360_CHIP_DATA_FILE);
++MODULE_FIRMWARE("b43/bcm4360-board-asus-rt-ac68u.bin");
++
++static bool b43_bdata_known(u16 kind, u16 id)
++{
++	if (kind == B43_BDATA_KIND_CHIP)
++		return id >= B43_BDATA_RFSEQ7 && id <= B43_BDATA_RX_EVM;
++	return id == B43_BDATA_FEM_LUT || id == B43_BDATA_RX_GAIN;
++}
++
++/* Validate header and section table; fill @bd. */
++static int b43_bdata_parse(const u8 *buf, size_t len, u16 kind,
++			   const struct b43_bcm4360_board *board,
++			   struct b43_bdata *bd)
++{
++	u8 tag[B43_BDATA_TAG_LEN] = { };
++	unsigned int i, j, n;
++	size_t table_end;
++
++	if (len < B43_BDATA_HDR_LEN || len > SZ_1M)
++		return -EINVAL;
++	if (memcmp(buf, B43_BDATA_MAGIC, 4) ||
++	    get_unaligned_le16(buf + 4) != B43_BDATA_ABI_VERSION ||
++	    get_unaligned_le16(buf + 6) != kind)
++		return -EINVAL;
++	if (get_unaligned_le32(buf + 16) != len ||
++	    (crc32_le(~0, buf + B43_BDATA_CRC_START,
++		      len - B43_BDATA_CRC_START) ^ ~0) !=
++	    get_unaligned_le32(buf + 20))
++		return -EBADMSG;
++
++	/* Identity: the device the board profile accepts. */
++	if (get_unaligned_le16(buf + 8) != board->chip_id ||
++	    buf[10] != B43_BDATA_PHY_TYPE_AC ||
++	    buf[11] != board->phy_rev ||
++	    get_unaligned_le16(buf + 12) != board->radio_ver ||
++	    buf[14] != board->radio_rev)
++		return -ENODEV;
++	if (kind == B43_BDATA_KIND_BOARD)
++		memcpy(tag, board->data_tag,
++		       strnlen(board->data_tag, sizeof(tag)));
++	if (memcmp(buf + 24, tag, sizeof(tag)))
++		return -ENODEV;
++
++	n = buf[15];
++	if (!n || n > B43_BDATA_MAX_SECTIONS)
++		return -EINVAL;
++	table_end = B43_BDATA_HDR_LEN + (size_t)n * B43_BDATA_SECT_LEN;
++	if (table_end > len)
++		return -EINVAL;
++
++	bd->n = n;
++	for (i = 0; i < n; i++) {
++		const u8 *s = buf + B43_BDATA_HDR_LEN + i * B43_BDATA_SECT_LEN;
++		struct b43_bdata_sect *sect = &bd->sect[i];
++		u64 size;
++
++		sect->id = get_unaligned_le16(s);
++		sect->flags = get_unaligned_le16(s + 2);
++		sect->elem_bits = s[4];
++		sect->offset = get_unaligned_le32(s + 8);
++		sect->count = get_unaligned_le32(s + 12);
++
++		if (s[5] || s[6] || s[7] ||
++		    (sect->flags & ~B43_BDATA_SECT_MANDATORY))
++			return -EINVAL;
++		if (sect->elem_bits != 8 && sect->elem_bits != 16 &&
++		    sect->elem_bits != 32)
++			return -EINVAL;
++		size = (u64)sect->count * (sect->elem_bits / 8);
++		if (!sect->count || (sect->offset & 3) ||
++		    sect->offset < table_end ||
++		    sect->offset + size > len)
++			return -EINVAL;
++		/* A section this driver does not know must not be required. */
++		if (!b43_bdata_known(kind, sect->id) &&
++		    (sect->flags & B43_BDATA_SECT_MANDATORY))
++			return -EOPNOTSUPP;
++		sect->p = buf + sect->offset;
++
++		for (j = 0; j < i; j++) {
++			const struct b43_bdata_sect *o = &bd->sect[j];
++			u64 osize = (u64)o->count * (o->elem_bits / 8);
++
++			if (o->id == sect->id)
++				return -EINVAL;
++			if (sect->offset < o->offset + osize &&
++			    o->offset < sect->offset + size)
++				return -EINVAL;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Return a known section with the expected element size and, if @count
++ * is non-zero, exactly @count elements; NULL if it is absent or has a
++ * different shape.
++ */
++static const struct b43_bdata_sect *
++b43_bdata_find(const struct b43_bdata *bd, u16 id, u8 elem_bits, u32 count)
++{
++	unsigned int i;
++
++	for (i = 0; i < bd->n; i++) {
++		const struct b43_bdata_sect *s = &bd->sect[i];
++
++		if (s->id != id)
++			continue;
++		if (s->elem_bits != elem_bits || (count && s->count != count))
++			return NULL;
++		return s;
++	}
++	return NULL;
++}
++
++static u16 b43_bdata_u16(const struct b43_bdata_sect *s, unsigned int i)
++{
++	return get_unaligned_le16(s->p + 2 * i);
++}
++
++static int b43_bcm4360_build_rfseq7(struct b43_bcm4360_chip_pkg *pkg,
++				    const struct b43_bdata_sect *s)
++{
++	unsigned int pos = 0, words = 0, n = 0;
++
++	if (s->count > B43_BCM4360_MAX_RFSEQ7_WORDS)
++		return -EINVAL;
++	while (pos < s->count) {
++		u16 offset, count, i;
++
++		if (n == B43_BCM4360_MAX_RFSEQ7 || s->count - pos < 2)
++			return -EINVAL;
++		offset = b43_bdata_u16(s, pos);
++		count = b43_bdata_u16(s, pos + 1);
++		pos += 2;
++		if (!count || count > s->count - pos)
++			return -EINVAL;
++		for (i = 0; i < count; i++)
++			pkg->rfseq7_words[words + i] = b43_bdata_u16(s, pos + i);
++		pkg->rfseq7[n].id = 7;
++		pkg->rfseq7[n].offset = offset;
++		pkg->rfseq7[n].width = 16;
++		pkg->rfseq7[n].count = count;
++		pkg->rfseq7[n].data = &pkg->rfseq7_words[words];
++		words += count;
++		pos += count;
++		n++;
++	}
++	pkg->data.rfseq7 = pkg->rfseq7;
++	pkg->data.n_rfseq7 = n;
++	return 0;
++}
++
++static int b43_bcm4360_build_chip(struct b43_bcm4360_chip_pkg *pkg,
++				  const struct b43_bdata *bd)
++{
++	struct b43_bcm4360_rx_gain_tables *gt = &pkg->rx_gain_tables;
++	const struct b43_bdata_sect *s;
++	unsigned int i, ch, w;
++	int err;
++
++	s = b43_bdata_find(bd, B43_BDATA_PHASETRACK, 32,
++			   B43_BCM4360_PHASETRACK_LEN);
++	if (!s)
++		return -ENOENT;
++	for (i = 0; i < B43_BCM4360_PHASETRACK_LEN; i++)
++		pkg->phasetrack[i] = get_unaligned_le32(s->p + 4 * i);
++	pkg->init_tables[0].id = 0x05;
++	pkg->init_tables[0].offset = 0;
++	pkg->init_tables[0].width = 32;
++	pkg->init_tables[0].count = B43_BCM4360_PHASETRACK_LEN;
++	pkg->init_tables[0].data = pkg->phasetrack;
++	pkg->data.init_tables = pkg->init_tables;
++	pkg->data.n_init_tables = 1;
++
++	s = b43_bdata_find(bd, B43_BDATA_RFSEQ7, 16, 0);
++	if (!s)
++		return -ENOENT;
++	err = b43_bcm4360_build_rfseq7(pkg, s);
++	if (err)
++		return err;
++
++	s = b43_bdata_find(bd, B43_BDATA_PREFREGS, 16, 0);
++	if (!s || (s->count & 1) || s->count > 2 * B43_BCM4360_MAX_PREFREGS)
++		return -ENOENT;
++	for (i = 0; i < s->count / 2; i++) {
++		pkg->prefregs[i].reg = b43_bdata_u16(s, 2 * i);
++		pkg->prefregs[i].value = b43_bdata_u16(s, 2 * i + 1);
++	}
++	pkg->data.prefregs = pkg->prefregs;
++	pkg->data.n_prefregs = s->count / 2;
++
++	s = b43_bdata_find(bd, B43_BDATA_CHAN_2G, 16,
++			   B43_BCM4360_N_CHAN_2G * B43_BCM2069_REV4_CHAN_WORDS);
++	if (!s)
++		return -ENOENT;
++	for (ch = 0; ch < B43_BCM4360_N_CHAN_2G; ch++) {
++		for (w = 0; w < B43_BCM2069_REV4_CHAN_WORDS; w++)
++			pkg->chan_2g[ch][w] =
++				b43_bdata_u16(s, ch * B43_BCM2069_REV4_CHAN_WORDS + w);
++		if (pkg->chan_2g[ch][0] != ch + 1)
++			return -EINVAL;
++	}
++	pkg->data.chan_2g = pkg->chan_2g;
++	pkg->data.n_chan_2g = B43_BCM4360_N_CHAN_2G;
++
++	s = b43_bdata_find(bd, B43_BDATA_FARROW_2G, 16,
++			   2 * B43_BCM4360_N_CHAN_2G);
++	if (!s)
++		return -ENOENT;
++	for (ch = 0; ch < B43_BCM4360_N_CHAN_2G; ch++) {
++		pkg->farrow_2g[ch].deltaphase_lo = b43_bdata_u16(s, 2 * ch);
++		pkg->farrow_2g[ch].deltaphase_hi = b43_bdata_u16(s, 2 * ch + 1);
++	}
++	pkg->data.farrow_2g = pkg->farrow_2g;
++	pkg->data.n_farrow_2g = B43_BCM4360_N_CHAN_2G;
++
++	BUILD_BUG_ON(sizeof(*gt) != 59);
++	s = b43_bdata_find(bd, B43_BDATA_RX_GAIN_TABLES, 8, sizeof(*gt));
++	if (!s)
++		return -ENOENT;
++	memcpy(gt, s->p, sizeof(*gt));
++	pkg->data.rx_gain_tables = gt;
++
++	/* Optional; an RX_EVM section of the wrong shape is an error. */
++	s = b43_bdata_find(bd, B43_BDATA_RX_EVM, 8, sizeof(pkg->rx_evm));
++	if (s) {
++		memcpy(&pkg->rx_evm, s->p, sizeof(pkg->rx_evm));
++		pkg->data.rx_evm = &pkg->rx_evm;
++	} else {
++		for (i = 0; i < bd->n; i++)
++			if (bd->sect[i].id == B43_BDATA_RX_EVM)
++				return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int b43_bcm4360_build_board(struct b43_bcm4360_board_pkg *pkg,
++				   const struct b43_bdata *bd,
++				   const struct b43_bcm4360_board *board)
++{
++	struct b43_bcm4360_rx_gain *rxg = &pkg->rx_gain;
++	const struct b43_bdata_sect *s;
++	unsigned int i;
++	u16 elna, trloss;
++
++	if (!board->cores || board->cores > B43_BCM4360_MAX_FEM_CORES)
++		return -EINVAL;
++	s = b43_bdata_find(bd, B43_BDATA_FEM_LUT, 8, 32 * board->cores);
++	if (!s)
++		return -ENOENT;
++	for (i = 0; i < board->cores; i++)
++		memcpy(pkg->fem_lut[i], s->p + 32 * i, 32);
++	pkg->data.fem_lut = pkg->fem_lut;
++	pkg->data.n_fem_cores = board->cores;
++
++	s = b43_bdata_find(bd, B43_BDATA_RX_GAIN, 16,
++			   B43_BCM4360_RX_GAIN_WORDS);
++	if (!s)
++		return -ENOENT;
++	elna = b43_bdata_u16(s, 0);
++	trloss = b43_bdata_u16(s, 1);
++	if (elna > 0xff || trloss > 0x7f)
++		return -EINVAL;
++	rxg->elna_gain_db = elna;
++	rxg->trloss_db = trloss;
++	for (i = 0; i < 5; i++) {
++		rxg->gain_code_a[i] = b43_bdata_u16(s, 2 + i);
++		rxg->gain_code_b[i] = b43_bdata_u16(s, 7 + i);
++	}
++	rxg->rfseq_init_gain = b43_bdata_u16(s, 12);
++	pkg->data.rx_gain = rxg;
++
++	pkg->board = board;
++	return 0;
++}
++
++/* Load, validate and convert one package; @pkg is filled on success. */
++static int b43_bcm4360_load(struct device *dev, const char *name, u16 kind,
++			    const struct b43_bcm4360_board *board, void *pkg)
++{
++	const struct firmware *fw;
++	struct b43_bdata *bd;
++	int err;
++
++	err = firmware_request_nowarn(&fw, name, dev);
++	if (err) {
++		dev_err(dev,
++			"BCM4360: hardware data package %s not available (%d); device not initialized\n",
++			name, err);
++		return err;
++	}
++
++	bd = kzalloc(sizeof(*bd), GFP_KERNEL);
++	if (!bd) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++
++	err = b43_bdata_parse(fw->data, fw->size, kind, board, bd);
++	if (!err) {
++		if (kind == B43_BDATA_KIND_CHIP)
++			err = b43_bcm4360_build_chip(pkg, bd);
++		else
++			err = b43_bcm4360_build_board(pkg, bd, board);
++	}
++	if (err)
++		dev_err(dev,
++			"BCM4360: hardware data package %s rejected (%d); device not initialized\n",
++			name, err);
++
++	kfree(bd);
++	release_firmware(fw);
++	return err;
++}
++
++int b43_bcm4360_data_get(const struct b43_bcm4360_board *board,
++			 struct device *dev,
++			 const struct b43_bcm4360_data **data,
++			 const struct b43_bcm4360_board_data **board_data)
++{
++	struct b43_bcm4360_chip_pkg *chip = NULL;
++	struct b43_bcm4360_board_pkg *bpkg = NULL;
++	int err = 0;
++
++	if (!board->data_file || !board->data_tag)
++		return -ENOENT;
++
++	mutex_lock(&b43_bcm4360_data_mutex);
++
++	if (!b43_bcm4360_chip_pkg) {
++		chip = kzalloc(sizeof(*chip), GFP_KERNEL);
++		if (!chip) {
++			err = -ENOMEM;
++			goto out;
++		}
++		err = b43_bcm4360_load(dev, B43_BCM4360_CHIP_DATA_FILE,
++				       B43_BDATA_KIND_CHIP, board, chip);
++		if (err)
++			goto out;
++		b43_bcm4360_chip_pkg = chip;
++		chip = NULL;
++	}
++
++	/* One board per system: never replace data a device may be using. */
++	if (b43_bcm4360_board_pkg && b43_bcm4360_board_pkg->board != board) {
++		err = -EBUSY;
++		goto out;
++	}
++	if (!b43_bcm4360_board_pkg) {
++		bpkg = kzalloc(sizeof(*bpkg), GFP_KERNEL);
++		if (!bpkg) {
++			err = -ENOMEM;
++			goto out;
++		}
++		err = b43_bcm4360_load(dev, board->data_file,
++				       B43_BDATA_KIND_BOARD, board, bpkg);
++		if (err)
++			goto out;
++		b43_bcm4360_board_pkg = bpkg;
++		bpkg = NULL;
++	}
++
++	*data = &b43_bcm4360_chip_pkg->data;
++	*board_data = &b43_bcm4360_board_pkg->data;
++out:
++	mutex_unlock(&b43_bcm4360_data_mutex);
++	kfree(chip);
++	kfree(bpkg);
++	return err;
++}
++
++void b43_bcm4360_data_release(void)
++{
++	mutex_lock(&b43_bcm4360_data_mutex);
++	kfree(b43_bcm4360_chip_pkg);
++	b43_bcm4360_chip_pkg = NULL;
++	kfree(b43_bcm4360_board_pkg);
++	b43_bcm4360_board_pkg = NULL;
++	mutex_unlock(&b43_bcm4360_data_mutex);
++}

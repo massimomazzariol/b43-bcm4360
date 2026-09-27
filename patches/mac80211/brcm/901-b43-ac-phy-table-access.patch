@@ -1,0 +1,108 @@
+From: Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
+Subject: [PATCH] b43: add AC-PHY table access
+
+AC-PHY PHY-table write access and the loader for the initialisation
+tables of the BCM4360 hardware data set.
+---
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/tables_phy_ac.c
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Broadcom B43 wireless driver
++ * IEEE 802.11ac AC-PHY table access
++ *
++ * Copyright (c) 2026 Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
++ *
++ * AC-PHY table access uses separate ID (0x00d) and OFFSET (0x00e) registers
++ * plus three data registers (0x00f/0x010/0x011). The OFFSET register
++ * auto-increments after each logical entry, so it is programmed once per
++ * bulk transfer.  Table contents come from the BCM4360 data set.
++ */
++
++#include "b43.h"
++#include "phy_ac.h"
++#include "tables_phy_ac.h"
++
++/**************************************************
++ * Table access
++ **************************************************/
++
++void b43_phy_ac_table_write_bulk(struct b43_wldev *dev, u16 id, u16 offset,
++				 u16 width, u16 count, const void *data)
++{
++	const u8 *d8 = data;
++	const u16 *d16 = data;
++	const u32 *d32 = data;
++	u16 i;
++
++	b43_phy_write(dev, B43_PHY_AC_TABLE_ID, id);
++	b43_phy_write(dev, B43_PHY_AC_TABLE_OFFSET, offset);
++
++	for (i = 0; i < count; i++) {
++		switch (width) {
++		case 8:
++			b43_phy_write(dev, B43_PHY_AC_TABLE_DATA1, d8[i]);
++			break;
++		case 16:
++			b43_phy_write(dev, B43_PHY_AC_TABLE_DATA1, d16[i]);
++			break;
++		case 32:
++			b43_phy_write(dev, B43_PHY_AC_TABLE_DATA2, d32[i] >> 16);
++			b43_phy_write(dev, B43_PHY_AC_TABLE_DATA1,
++				      d32[i] & 0xffff);
++			break;
++		case 48:
++			/* 48-bit entries are three u16 words in memory order
++			 * (high, mid, low): DATA3 takes the high word, the
++			 * PHY data port then steps down to DATA2/DATA1.
++			 */
++			b43_phy_write(dev, B43_PHY_AC_TABLE_DATA3, d16[i * 3]);
++			b43_write16(dev, B43_MMIO_PHY_DATA, d16[i * 3 + 1]);
++			b43_write16(dev, B43_MMIO_PHY_DATA, d16[i * 3 + 2]);
++			break;
++		default:
++			B43_WARN_ON(1);
++			return;
++		}
++	}
++}
++
++/**************************************************
++ * Initialisation table loader
++ **************************************************/
++
++/* Write the data set's initialisation tables in order. */
++void b43_phy_ac_tables_init(struct b43_wldev *dev)
++{
++	const struct b43_bcm4360_data *data = dev->bcm4360_data;
++	const struct b43_phy_ac_tbl *t;
++	unsigned int i;
++
++	for (i = 0; i < data->n_init_tables; i++) {
++		t = &data->init_tables[i];
++		if (t->id == 6 &&
++		    b43_current_band(dev->wl) != NL80211_BAND_2GHZ)
++			continue;
++		b43_phy_ac_table_write_bulk(dev, t->id, t->offset, t->width,
++					    t->count, t->data);
++	}
++}
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/tables_phy_ac.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef B43_TABLES_PHY_AC_H_
++#define B43_TABLES_PHY_AC_H_
++
++#include <linux/types.h>
++
++#include "bcm4360.h"
++
++struct b43_wldev;
++
++void b43_phy_ac_table_write_bulk(struct b43_wldev *dev, u16 id, u16 offset,
++				 u16 width, u16 count, const void *data);
++void b43_phy_ac_tables_init(struct b43_wldev *dev);
++
++#endif /* B43_TABLES_PHY_AC_H_ */

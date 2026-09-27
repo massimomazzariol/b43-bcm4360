@@ -1,0 +1,1565 @@
+From: Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
+Subject: [PATCH] b43: AC-PHY: BCM4360 2.4 GHz receive path
+
+AC-PHY rev 1 initialisation and channel switching for the BCM4360
+2.4 GHz device: carrier-search control, BCM2069 channel programming,
+RX LPF, receive gains, clip and energy-detect thresholds, board
+front-end control table and per-channel RX Farrow/SFO.  Receive only:
+no TX power control or calibration that transmits.
+
+Chip/radio tables and board settings are not part of the source; they
+come from the data sets described in bcm4360.h.  Kconfig: B43_PHY_AC is
+no longer BROKEN but only initialises the BCM4360 receive-only device.
+---
+--- a/drivers/net/wireless/broadcom/b43/Kconfig
++++ b/drivers/net/wireless/broadcom/b43/Kconfig
+@@ -150,13 +150,24 @@ config B43_PHY_LCN
+ 	  Say N, this is BROKEN and crashes driver.
+ 
+ config B43_PHY_AC
+-	bool "Support for AC-PHY (802.11ac) devices (BROKEN)"
+-	depends on B43 && B43_BCMA && BROKEN
++	bool "Support for AC-PHY devices (EXPERIMENTAL, receive-only BCM4360)"
++	depends on B43 && B43_BCMA
+ 	help
++	  Experimental support for Broadcom AC-PHY devices.
++
+ 	  This PHY type can be found in the following chipsets:
+ 	  PCI: BCM4352, BCM4360
+ 
+-	  Say N, this is BROKEN and crashes driver.
++	  Only the BCM4360 2.4 GHz device (SPROM device ID 0x43a1, AC-PHY
++	  rev 1, BCM2069 rev 4) on the ASUS RT-AC68U (device tree compatible
++	  "asus,rt-ac68u") is initialized, as a receive-only device: passive
++	  scanning and monitor reception, with transmission disabled.  Every
++	  other AC-PHY device and every other board is rejected.
++
++	  The device also needs two hardware data packages in the firmware
++	  search path (b43/bcm4360-ac1-2069r4.bin and the board package);
++	  they are not part of the kernel sources.  Without them the device
++	  is not initialized.
+ 
+ # This config option automatically enables b43 LEDS support,
+ # if it's possible.
+--- a/drivers/net/wireless/broadcom/b43/Makefile
++++ b/drivers/net/wireless/broadcom/b43/Makefile
+@@ -14,7 +14,8 @@ b43-$(CPTCFG_B43_PHY_HT)	+= phy_ht.o
+ b43-$(CPTCFG_B43_PHY_HT)	+= tables_phy_ht.o
+ b43-$(CPTCFG_B43_PHY_HT)	+= radio_2059.o
+ b43-$(CPTCFG_B43_PHY_LCN)	+= phy_lcn.o tables_phy_lcn.o
+-b43-$(CPTCFG_B43_PHY_AC)	+= phy_ac.o
++b43-$(CPTCFG_B43_PHY_AC)	+= phy_ac.o tables_phy_ac.o radio_2069.o
++b43-$(CPTCFG_B43_PHY_AC)	+= bcm4360_board.o bcm4360_data_fw.o
+ b43-y				+= sysfs.o
+ b43-y				+= xmit.o
+ b43-y				+= dma.o
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/bcm4360.h
+@@ -0,0 +1,187 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Broadcom B43 wireless driver
++ * BCM4360 receive-only support: board profiles and hardware data sets
++ *
++ * Copyright (c) 2026 Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
++ */
++#ifndef B43_BCM4360_H_
++#define B43_BCM4360_H_
++
++#include <linux/types.h>
++
++struct b43_wldev;
++struct bcma_device;
++struct device;
++
++/*
++ * BCM4360 receive-only support is split in three layers:
++ *
++ *   AC-PHY code (phy_ac.c, tables_phy_ac.c)       chip and PHY behaviour
++ *   BCM4360 data set (struct b43_bcm4360_data)   chip/radio tables
++ *   board profile (struct b43_bcm4360_board)     one supported board
++ *
++ * The data sets are not part of the driver source.  They are loaded from
++ * two data packages in the firmware search path (bcm4360_data_fw.c): one
++ * for the chip/radio, one for the board.  A device is only brought up
++ * when a board profile matches it and both packages are present and
++ * valid; otherwise it is rejected before any PHY or radio access.
++ */
++
++/* One PHY table write: table id, first offset, entry width (bits), count. */
++struct b43_phy_ac_tbl {
++	u16 id;
++	u16 offset;
++	u16 width;
++	u16 count;
++	const void *data;
++};
++
++/* BCM2069 rev 4 2.4 GHz channel row: 58 words, word 0 is the channel. */
++#define B43_BCM2069_REV4_CHAN_WORDS	58
++
++struct b43_bcm2069_reg_value {
++	u16 reg;
++	u16 value;
++};
++
++/* Per-channel receive Farrow resampler phase increment (24 bits). */
++struct b43_bcm4360_farrow {
++	u16 deltaphase_lo;
++	u16 deltaphase_hi;
++};
++
++/*
++ * Receive gain tables (2.4 GHz): gain, gain-bits and gain-limit entries
++ * of the LNA1, LNA2 and mixer/TIA stages, written to the per-core gain
++ * tables at every channel change.
++ */
++struct b43_bcm4360_rx_gain_tables {
++	u8 lna1_gain[6];
++	u8 lna1_gainbits[6];
++	u8 lna1_gainlimit[6];
++	u8 lna2_gain[7];
++	u8 lna2_gainbits[7];
++	u8 lna2_gainlimit[7];
++	u8 mix_gain[10];
++	u8 mix_gainbits[10];
++};
++
++/* RX EVM shaping entries of PHY table 4 (offsets 0x01 and 0x3d). */
++struct b43_bcm4360_rx_evm {
++	u8 lo[3];
++	u8 hi[3];
++};
++
++/* Chip/radio data set for BCM4360 / AC-PHY rev 1 / BCM2069 rev 4. */
++struct b43_bcm4360_data {
++	/* PHY tables written once before the first channel set. */
++	const struct b43_phy_ac_tbl *init_tables;
++	unsigned int n_init_tables;
++
++	/* RF-sequencer (table 7) entries written after the RX LPF update. */
++	const struct b43_phy_ac_tbl *rfseq7;
++	unsigned int n_rfseq7;
++
++	/* Optional: tables written on every channel set. */
++	const struct b43_phy_ac_tbl *chan_tables;
++	unsigned int n_chan_tables;
++
++	/* BCM2069 rev 4 radio register defaults. */
++	const struct b43_bcm2069_reg_value *prefregs;
++	unsigned int n_prefregs;
++
++	/* Channels 1..14, rows in channel order. */
++	const u16 (*chan_2g)[B43_BCM2069_REV4_CHAN_WORDS];
++	unsigned int n_chan_2g;
++
++	/* Channels 1..14. */
++	const struct b43_bcm4360_farrow *farrow_2g;
++	unsigned int n_farrow_2g;
++
++	/* Receive gain tables. */
++	const struct b43_bcm4360_rx_gain_tables *rx_gain_tables;
++
++	/* Optional: RX EVM shaping entries. */
++	const struct b43_bcm4360_rx_evm *rx_evm;
++};
++
++/* Receive gain configuration that depends on the board front end. */
++struct b43_bcm4360_rx_gain {
++	u8 elna_gain_db;		/* external LNA gain */
++	u8 trloss_db;			/* T/R switch loss */
++	u16 gain_code_a[5];		/* init, high, mid, low, clip2 */
++	u16 gain_code_b[5];
++	u16 rfseq_init_gain;
++};
++
++/* Board-specific data set. */
++struct b43_bcm4360_board_data {
++	/* Front-end control table (PHY table 0x0a), 32 entries per core. */
++	const u8 (*fem_lut)[32];
++	unsigned int n_fem_cores;
++
++	/* Receive gain configuration. */
++	const struct b43_bcm4360_rx_gain *rx_gain;
++};
++
++struct b43_bcm4360_board {
++	const char *name;
++	const char *compatible;		/* device tree machine compatible */
++
++	/* Accepted device: chip, SPROM device id (radio slot), PHY, radio. */
++	u16 chip_id;
++	u16 sprom_dev_id;
++	u8 phy_rev;
++	u16 radio_ver;
++	u8 radio_rev;
++	u8 cores;
++
++	/* NVRAM prefix of this radio slot, used to validate board data. */
++	const char *nvram_prefix;
++	u32 xtal_khz;			/* reference crystal */
++	u8 femctrl;			/* NVRAM femctrl */
++	u8 fem_variant;			/* boardflags3[2:0] */
++	u32 boardflags3_clear;		/* boardflags3 bits that must be clear */
++	u8 rxgains_elna;		/* NVRAM rxgains2gelnagaina0..2 */
++	u8 rxgains_triso;		/* NVRAM rxgains2gtrisoa0..2 */
++
++	/* Board data package: file name and the tag stored in its header. */
++	const char *data_file;
++	const char *data_tag;
++};
++
++/* Chip/radio data package (firmware search path). */
++#define B43_BCM4360_CHIP_DATA_FILE	"b43/bcm4360-ac1-2069r4.bin"
++
++#ifdef CPTCFG_B43_PHY_AC
++const struct b43_bcm4360_board *b43_bcm4360_board_match(struct b43_wldev *dev);
++bool b43_bcm4360_bcma_ready(struct bcma_device *core);
++
++/*
++ * Data provider: load (once) and validate the chip/radio and board data
++ * packages; return 0 and fill both pointers, or a negative error.
++ */
++int b43_bcm4360_data_get(const struct b43_bcm4360_board *board,
++			 struct device *dev,
++			 const struct b43_bcm4360_data **data,
++			 const struct b43_bcm4360_board_data **board_data);
++/* Free the loaded data packages (module exit). */
++void b43_bcm4360_data_release(void);
++
++/* Check that the data sets hold every section the receive path needs. */
++int b43_bcm4360_data_check(const struct b43_bcm4360_board *board,
++			   const struct b43_bcm4360_data *data,
++			   const struct b43_bcm4360_board_data *board_data);
++#else
++static inline bool b43_bcm4360_bcma_ready(struct bcma_device *core)
++{
++	return false;
++}
++
++static inline void b43_bcm4360_data_release(void)
++{
++}
++#endif
++
++#endif /* B43_BCM4360_H_ */
+--- a/drivers/net/wireless/broadcom/b43/phy_ac.c
++++ b/drivers/net/wireless/broadcom/b43/phy_ac.c
+@@ -4,10 +4,402 @@
+  * IEEE 802.11ac AC-PHY support
+  *
+  * Copyright (c) 2015 Rafał Miłecki <zajec5@gmail.com>
++ * Copyright (c) 2026 Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
+  */
+ 
++#include <linux/delay.h>
++
+ #include "b43.h"
++#include "main.h"
+ #include "phy_ac.h"
++#include "bcm4360.h"
++#include "tables_phy_ac.h"
++#include "radio_2069.h"
++
++/*
++ * BCM4360 (AC-PHY rev 1, BCM2069 rev 4) 2.4 GHz receive path.
++ *
++ * Chip and radio tables come from dev->bcm4360_data, board front-end
++ * settings from dev->bcm4360_board and dev->bcm4360_board_data (see
++ * bcm4360.h).  Only the AC-PHY rev 1 receive path is implemented.
++ */
++static void b43_phy_ac_resetcca_rev1(struct b43_wldev *dev);
++
++/* RF-sequencer (table 7) entries written after the RX LPF update. */
++static void
++b43_phy_ac_bcm4360_post_rxlpf_table7_rev1(struct b43_wldev *dev)
++{
++	const struct b43_bcm4360_data *data = dev->bcm4360_data;
++	unsigned int i;
++	u16 saved;
++
++	saved = b43_phy_read(dev, 0x019e) & 0x0002;
++	b43_phy_maskset(dev, 0x019e, (u16)~0x0002, 0x0002);
++
++	for (i = 0; i < data->n_rfseq7; i++)
++		b43_phy_ac_table_write_bulk(dev, data->rfseq7[i].id,
++					    data->rfseq7[i].offset,
++					    data->rfseq7[i].width,
++					    data->rfseq7[i].count,
++					    data->rfseq7[i].data);
++
++	b43_phy_maskset(dev, 0x019e, (u16)~0x0002, saved);
++}
++
++/*
++ * Update the two RX LPF fields (bits 6..16 and 17..25) of the selected
++ * RF-sequencer table 7 groups for the selected cores.  Each entry is
++ * split over a low and a high 16-bit table word.
++ */
++bool b43_phy_ac_rx_lpf_update(struct b43_wldev *dev, u8 groups,
++			      u8 rx_mask, u16 field6, u16 field17)
++{
++	static const u16 offsets[3][2][3] = {
++		{ { 0x140, 0x150, 0x160 }, { 0x360, 0x370, 0x380 } },
++		{ { 0x141, 0x151, 0x161 }, { 0x361, 0x371, 0x381 } },
++		{ { 0x441, 0x443, 0x445 }, { 0x440, 0x442, 0x444 } },
++	};
++	u8 cores = b43_radio_2069_core_count(dev);
++	u16 saved;
++	unsigned int core, group;
++
++	if (cores > 3 || (groups & ~7) || (rx_mask & ~7))
++		return false;
++
++	saved = b43_phy_read(dev, 0x019e) & 2;
++	b43_phy_maskset(dev, 0x019e, (u16)~2, 2);
++	for (core = 0; core < cores; core++) {
++		if (!(rx_mask & BIT(core)))
++			continue;
++		for (group = 0; group < 3; group++) {
++			u16 lo, hi;
++			u32 value;
++
++			if (!(groups & BIT(group)))
++				continue;
++			b43_phy_write(dev, B43_PHY_AC_TABLE_ID, 7);
++			b43_phy_write(dev, B43_PHY_AC_TABLE_OFFSET,
++				      offsets[group][0][core]);
++			lo = b43_phy_read(dev, B43_PHY_AC_TABLE_DATA1);
++			b43_phy_write(dev, B43_PHY_AC_TABLE_ID, 7);
++			b43_phy_write(dev, B43_PHY_AC_TABLE_OFFSET,
++				      offsets[group][1][core]);
++			hi = b43_phy_read(dev, B43_PHY_AC_TABLE_DATA1);
++			value = lo | ((u32)hi << 16);
++			/* Two masks, applied in this order. */
++			value = (value & 0x01ffc03f) | ((u32)field6 << 6);
++			value = (value & 0x0001ffff) | ((u32)field17 << 17);
++			lo = value;
++			hi = (value >> 16) & 0x01ff;
++			b43_phy_ac_table_write_bulk(dev, 7,
++						    offsets[group][0][core],
++						    16, 1, &lo);
++			b43_phy_ac_table_write_bulk(dev, 7,
++						    offsets[group][1][core],
++						    16, 1, &hi);
++		}
++	}
++	b43_phy_maskset(dev, 0x019e, (u16)~2, saved);
++
++	/* After the last group: RF-sequencer entries. */
++	if (groups == 0x04 && rx_mask == 0x07)
++		b43_phy_ac_bcm4360_post_rxlpf_table7_rev1(dev);
++
++	return true;
++}
++
++/*
++ * Board front-end control table (PHY table 0x0a), 32 entries per core.
++ * Entries 0-15 drive the T/R switch and external LNA on 2.4 GHz.
++ */
++static void b43_phy_ac_bcm4360_femctrl_lut(struct b43_wldev *dev)
++{
++	const struct b43_bcm4360_board_data *bd = dev->bcm4360_board_data;
++	unsigned int core;
++
++	for (core = 0; core < bd->n_fem_cores; core++)
++		b43_phy_ac_table_write_bulk(dev, 0x000a, core * 32, 8, 32,
++					    bd->fem_lut[core]);
++}
++
++/*
++ * Receive gain state established before the CCA reset and the per-core
++ * calibration: LNA1/LNA2/eLNA/mixer gain tables, init and clip gains,
++ * NB/W1 clip thresholds, CRS and bandwidth seeds (2.4 GHz, no desense).
++ */
++static void
++b43_phy_ac_bcm4360_pre_afecal_rxgain_rev1(struct b43_wldev *dev)
++{
++	/* Gain-code registers per state (init, high, mid, low, clip2). */
++	static const u16 gain_code_reg_a[5][3] = {
++		{ 0x06dc, 0x08dc, 0x0adc },
++		{ 0x06de, 0x08de, 0x0ade },
++		{ 0x06e0, 0x08e0, 0x0ae0 },
++		{ 0x06e2, 0x08e2, 0x0ae2 },
++		{ 0x06e4, 0x08e4, 0x0ae4 },
++	};
++
++	static const u16 gain_code_reg_b[5][3] = {
++		{ 0x06dd, 0x08dd, 0x0add },
++		{ 0x06df, 0x08df, 0x0adf },
++		{ 0x06e1, 0x08e1, 0x0ae1 },
++		{ 0x06e3, 0x08e3, 0x0ae3 },
++		{ 0x06e5, 0x08e5, 0x0ae5 },
++	};
++
++	u16 core;
++	u16 state;
++
++	/*
++	 * NB/W1 clip thresholds without desense:
++	 *   NB: mux 2, NBRSSI reference control high 1
++	 *   W1: mux 2, wideband RSSI1 threshold 15
++	 */
++	static const u16 rssi_clip_mux_reg[3] = {
++		0x06ee, 0x08ee, 0x0aee,
++	};
++
++	static const u16 radio_nbrssi_reg[3] = {
++		0x0045, 0x0245, 0x0445,
++	};
++
++	static const u16 radio_lna2g_rssi_reg[3] = {
++		0x002c, 0x022c, 0x042c,
++	};
++
++	const struct b43_bcm4360_rx_gain_tables *gt =
++		dev->bcm4360_data->rx_gain_tables;
++	const struct b43_bcm4360_rx_gain *rxg =
++		dev->bcm4360_board_data->rx_gain;
++	const u8 elna_gain[2] = { rxg->elna_gain_db, rxg->elna_gain_db };
++	u16 stall_save;
++	u16 fine_rx_clk_save;
++
++	/* RX front-end setup (AC-PHY rev 1). */
++	b43_phy_maskset(dev, 0x02d1, (u16)~0x00f0, 0x0040);
++	b43_phy_maskset(dev, 0x02d1, (u16)~0x0f00, 0x0400);
++
++	b43_phy_write(dev, 0x0358, 0xc07f);
++	b43_phy_write(dev, 0x0359, 0x0064);
++	b43_phy_write(dev, 0x035a, 0x0064);
++
++	b43_phy_ac_bcm4360_femctrl_lut(dev);
++
++	/*
++	 * Hold RxFeCtrl1.disable_stalls and the forced gain-gated clocks
++	 * while the gain tables are written; restore both before the gain
++	 * codes.
++	 */
++	stall_save = b43_phy_read(dev, 0x019e);
++	b43_phy_set(dev, 0x019e, 0x0002);
++
++	fine_rx_clk_save = b43_phy_read(dev, 0x016c);
++	b43_phy_set(dev, 0x016c, 0x0040);
++
++	/* LNA1, cores 0..2. */
++	b43_phy_ac_table_write_bulk(dev, 0x0044, 0x0008, 8, 6, gt->lna1_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0045, 0x0008, 8, 6, gt->lna1_gainbits);
++
++	b43_phy_ac_table_write_bulk(dev, 0x0064, 0x0008, 8, 6, gt->lna1_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0065, 0x0008, 8, 6, gt->lna1_gainbits);
++
++	b43_phy_ac_table_write_bulk(dev, 0x0084, 0x0008, 8, 6, gt->lna1_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0085, 0x0008, 8, 6, gt->lna1_gainbits);
++
++	/* LNA1 gain limits (shared). */
++	b43_phy_ac_table_write_bulk(dev, 0x000b, 0x0008, 8, 6, gt->lna1_gainlimit);
++
++	/* LNA2, cores 0..2. */
++	b43_phy_ac_table_write_bulk(dev, 0x0044, 0x0010, 8, 7, gt->lna2_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0045, 0x0010, 8, 7, gt->lna2_gainbits);
++
++	b43_phy_ac_table_write_bulk(dev, 0x0064, 0x0010, 8, 7, gt->lna2_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0065, 0x0010, 8, 7, gt->lna2_gainbits);
++
++	b43_phy_ac_table_write_bulk(dev, 0x0084, 0x0010, 8, 7, gt->lna2_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0085, 0x0010, 8, 7, gt->lna2_gainbits);
++
++	/* LNA2 gain limits (shared). */
++	b43_phy_ac_table_write_bulk(dev, 0x000b, 0x0010, 8, 7, gt->lna2_gainlimit);
++
++	/* Board external LNA gain: eLNA stage, two entries at offset 0. */
++	b43_phy_ac_table_write_bulk(dev, 0x0044, 0x0000, 8, 2, elna_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0064, 0x0000, 8, 2, elna_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0084, 0x0000, 8, 2, elna_gain);
++
++	/* Board T/R switch loss: freqGainTLossN, bits [14:8] per core. */
++	for (core = 0; core < 3; core++)
++		b43_phy_maskset(dev, 0x06f9 + (core << 9), (u16)~0x7f00,
++				(u16)rxg->trloss_db << 8);
++
++	/* 2.4 GHz: lna2_gm_sz = 2, mix/tia_gm_sz = 1. */
++	b43_phy_write(dev, 0x073b, 0x0018);
++	b43_phy_write(dev, 0x093b, 0x0018);
++	b43_phy_write(dev, 0x0b3b, 0x0018);
++
++	b43_phy_write(dev, 0x0726, 0x000c);
++	b43_phy_write(dev, 0x0926, 0x000c);
++	b43_phy_write(dev, 0x0b26, 0x000c);
++
++	/* Mixer/TIA stage, 10 entries at offset 32. */
++	b43_phy_ac_table_write_bulk(dev, 0x0044, 0x0020, 8, 10, gt->mix_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0045, 0x0020, 8, 10, gt->mix_gainbits);
++
++	b43_phy_ac_table_write_bulk(dev, 0x0064, 0x0020, 8, 10, gt->mix_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0065, 0x0020, 8, 10, gt->mix_gainbits);
++
++	b43_phy_ac_table_write_bulk(dev, 0x0084, 0x0020, 8, 10, gt->mix_gain);
++	b43_phy_ac_table_write_bulk(dev, 0x0085, 0x0020, 8, 10, gt->mix_gainbits);
++
++	/* Restore the stall and clock-gate state saved above. */
++	b43_phy_write(dev, 0x016c, fine_rx_clk_save);
++	b43_phy_maskset(dev, 0x019e, (u16)~0x0002,
++			stall_save & 0x0002);
++
++	/*
++	 * Gain codes per core: init (also the RF-sequencer init gain),
++	 * high, mid, low, clip2.
++	 */
++	for (core = 0; core < 3; core++) {
++		for (state = 0; state < 5; state++) {
++			b43_phy_write(dev, gain_code_reg_a[state][core],
++				      rxg->gain_code_a[state]);
++
++			b43_phy_write(dev, gain_code_reg_b[state][core],
++				      rxg->gain_code_b[state]);
++
++			if (state == 0)
++				b43_phy_ac_table_write_bulk(dev, 0x0007,
++							    0x00f9 + core,
++							    16, 1,
++							    &rxg->rfseq_init_gain);
++		}
++	}
++
++	/* NB/W1 clip thresholds per core. */
++	for (core = 0; core < 3; core++) {
++		/* NB clip mux select: bits 1:0 = 2. */
++		b43_phy_maskset(dev, rssi_clip_mux_reg[core],
++				(u16)~0x0003, 0x0002);
++
++		/* NBRSSI reference control high: bit 6 = 1. */
++		b43_radio_maskset(dev, radio_nbrssi_reg[core],
++				  (u16)~0x0040, 0x0040);
++
++		/* W1 clip mux select: bits 3:2 = 2. */
++		b43_phy_maskset(dev, rssi_clip_mux_reg[core],
++				(u16)~0x000c, 0x0008);
++
++		/* Wideband RSSI1 threshold: bits 7:4 = 15. */
++		b43_radio_maskset(dev, radio_lna2g_rssi_reg[core],
++				  (u16)~0x00f0, 0x00f0);
++	}
++
++	/* CRS minimum power (main and sub-band, l/u): high byte 0x36. */
++	{
++		static const u16 crs_seed_regs[8] = {
++			0x0324, 0x0330,
++			0x0321, 0x032d,
++			0x032a, 0x0336,
++			0x0327, 0x0333,
++		};
++		unsigned int i;
++
++		for (i = 0; i < 8; i++)
++			b43_phy_maskset(dev, crs_seed_regs[i],
++					(u16)~0xff00, 0x3600);
++	}
++
++	/* 20 MHz bandwidth-select words. */
++	{
++		static const u16 bw_sel_regs[4] = {
++			0x0304, 0x0307, 0x030a, 0x030d
++		};
++		unsigned int i;
++
++		for (i = 0; i < 4; i++)
++			b43_phy_write(dev, bw_sel_regs[i], 0x4e51);
++	}
++
++	/*
++	 * No desense: BPHY detector state DigiGainLimit0 (0x0299) = 0x4477,
++	 * PeakEnergyL (0x03c1) = 0x0010.
++	 */
++	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
++		b43_phy_write(dev, 0x0299, 0x4477);
++		b43_phy_write(dev, 0x03c1, 0x0010);
++	}
++}
++
++/* RX baseband setup, run at the end of every channel change. */
++void b43_phy_ac_bcm4360_rx_rev1_prepare(struct b43_wldev *dev)
++{
++	u32 ioctl;
++	u16 base;
++	u8 core_count;
++	unsigned int core;
++
++	b43_phy_set(dev, 0x019e, 0x01c0);
++	b43_phy_write(dev, 0x03c4, 0x0668);
++	b43_phy_set(dev, 0x019e, 0x0200);
++	b43_phy_maskset(dev, 0x019e, (u16)~0x003c, 0x0010);
++	b43_phy_write(dev, 0x01f2, 0x00c8);
++	b43_phy_write(dev, 0x0026, 0x0092);
++	b43_phy_write(dev, 0x01ed, 0x0050);
++	b43_phy_write(dev, 0x0025, 0x0030);
++
++	/* D11 core flag 0x10 (core I/O control). */
++	ioctl = bcma_aread32(dev->dev->bdev, BCMA_IOCTL);
++	ioctl |= 0x00000010;
++	bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, ioctl);
++
++	b43_phy_mask(dev, 0x040f, (u16)~0x0200);
++
++	b43_phy_mask(dev, 0x02f1, (u16)~0x0020);
++	b43_phy_mask(dev, 0x02ed, (u16)~0x0020);
++	b43_phy_mask(dev, 0x02f9, (u16)~0x0020);
++	b43_phy_mask(dev, 0x02f5, (u16)~0x0020);
++
++	b43_phy_maskset(dev, 0x02ef, (u16)~0x00ff, 0x0055);
++	b43_phy_maskset(dev, 0x02eb, (u16)~0x00ff, 0x0055);
++	b43_phy_maskset(dev, 0x02f7, (u16)~0x00ff, 0x0055);
++	b43_phy_maskset(dev, 0x02f3, (u16)~0x00ff, 0x0055);
++
++	/* AC-PHY rev 1 does not need the rev 2/5/6 settings. */
++	b43_phy_write(dev, 0x0400, 0x0000);
++	b43_phy_mask(dev, 0x01ca, (u16)~0x1000);
++
++	b43_phy_ac_resetcca_rev1(dev);
++
++	b43_phy_set(dev, 0x0072, 0x0004);
++	b43_phy_mask(dev, 0x01b0, (u16)~0x0020);
++	b43_phy_set(dev, 0x01b1, 0x1000);
++	b43_phy_mask(dev, 0x01b6, (u16)~0x8000);
++
++	core_count = b43_radio_2069_core_count(dev);
++
++	for (core = 0; core < core_count; core++) {
++		base = 0x0690 + core * 0x0200;
++		b43_phy_set(dev, base, 0x0200);
++	}
++
++	for (core = 0; core < core_count; core++) {
++		base = 0x0690 + core * 0x0200;
++		b43_phy_set(dev, base, 0x0400);
++	}
++
++	b43_phy_write(dev, 0x01e6, 0x0030);
++
++	/* RX front-end setup (AC-PHY rev 1). */
++	b43_phy_maskset(dev, 0x02d1, (u16)~0x00f0, 0x0040);
++	b43_phy_maskset(dev, 0x02d1, (u16)~0x0f00, 0x0400);
++
++	b43_phy_write(dev, 0x0358, 0xc07f);
++	b43_phy_write(dev, 0x0359, 0x0064);
++	b43_phy_write(dev, 0x035a, 0x0064);
++
++	b43_phy_ac_bcm4360_femctrl_lut(dev);
++}
+ 
+ /**************************************************
+  * Basic PHY ops
+@@ -22,6 +414,15 @@ static int b43_phy_ac_op_allocate(struct b43_wldev *dev)
+ 		return -ENOMEM;
+ 	dev->phy.ac = phy_ac;
+ 
++	/* BCM2069 analog-calibration defaults until the first calibration. */
++	phy_ac->radio2069_cal_lpf_a = 0x80;
++	phy_ac->radio2069_cal_lpf_b = 0x80;
++	phy_ac->radio2069_cal_dacbuf = 0x0c;
++	phy_ac->radio2069_init_error = 0;
++
++	phy_ac->carrier_search_depth = 0;
++	phy_ac->carrier_search_339_restore = 0x0fff;
++
+ 	return 0;
+ }
+ 
+@@ -34,6 +435,16 @@ static void b43_phy_ac_op_free(struct b43_wldev *dev)
+ 	phy->ac = NULL;
+ }
+ 
++/*
++ * b43_wireless_core_init() calls ->prepare_structs() unconditionally.
++ * op_allocate() already zeroes the AC-PHY state and installs the BCM2069
++ * software defaults, so there is nothing to reset here.
++ */
++static void b43_phy_ac_op_prepare_structs(struct b43_wldev *dev)
++{
++	(void)dev;
++}
++
+ static void b43_phy_ac_op_maskset(struct b43_wldev *dev, u16 reg, u16 mask,
+ 				  u16 set)
+ {
+@@ -76,13 +487,825 @@ static void b43_phy_ac_op_adjust_txpower(struct b43_wldev *dev)
+  * PHY ops struct
+  **************************************************/
+ 
++/*
++ * AC-PHY radio power control.
++ *
++ * b43's software_rfkill callback is void.  Store any power-up failure in
++ * radio2069_init_error; b43_phy_ac_op_init() propagates it through the normal
++ * b43 PHY-init error path.
++ *
++ * The blocked path only gates the two PLL power bits.
++ */
++static void b43_phy_ac_op_software_rfkill(struct b43_wldev *dev, bool blocked)
++{
++	struct b43_phy_ac *ac = dev->phy.ac;
++	u16 chip = dev->dev->chip_id;
++	u16 pu_reg;
++	int err = 0;
++
++	if (b43_read32(dev, B43_MMIO_MACCTL) & B43_MACCTL_ENABLED)
++		b43err(dev->wl,
++		       "AC-PHY software rfkill called while MAC is enabled\n");
++
++	if (chip == 0x4352 || chip == 0x4360 ||
++	    chip == 0xa9c4 || chip == 0xaa06)
++		pu_reg = 0x080b;
++	else
++		pu_reg = 0x080c;
++
++	if (blocked) {
++		/* Radio off: gate both PLL power bits. */
++		b43_radio_mask(dev, pu_reg, (u16)~0x6000);
++		ac->radio2069_init_error = 0;
++		return;
++	}
++
++	if (dev->phy.radio_ver != 0x2069) {
++		err = -ENODEV;
++		b43err(dev->wl,
++		       "AC-PHY unsupported radio 0x%04x\n",
++		       dev->phy.radio_ver);
++		goto fail;
++	}
++
++	/* Only BCM2069 rev 4 is supported. */
++	if (dev->phy.radio_rev != 4) {
++		err = -EOPNOTSUPP;
++		b43err(dev->wl,
++		       "BCM2069 unsupported rev: rev=%u\n",
++		       dev->phy.radio_rev);
++		goto fail;
++	}
++
++	err = b43_radio_2069_power_up_rev4_class0(dev);
++	if (err) {
++		b43err(dev->wl,
++		       "BCM2069 rev4 power-up failed: %d\n",
++		       err);
++		goto fail;
++	}
++
++	ac->radio2069_init_error = 0;
++
++	return;
++
++fail:
++	/* Do not leave the RF PLL powered after a failed power-up. */
++	b43_radio_mask(dev, pu_reg, (u16)~0x6000);
++	ac->radio2069_init_error = err;
++}
++
++/*
++ * Error bridge for the void software_rfkill callback.
++ *
++ * b43_phy_init() invokes software_rfkill(false) immediately before ->init().
++ * Returning the preserved error here enters b43's normal err_block_rf path.
++ */
++static int b43_phy_ac_op_init(struct b43_wldev *dev)
++{
++	int err = dev->phy.ac->radio2069_init_error;
++
++	if (err)
++		return err;
++
++	return 0;
++}
++
++/*
++ * AC-PHY rev 1 CCA reset: force the PHY clock, pulse BBCFG.RSTCCA
++ * (0x001 bit 0x4000), restore the saved value, release the forced clock
++ * and settle.  On the BCM4360 (D11 rev 42) the PHY header parameter in
++ * MMIO 0x492 is set to 6 around the pulse and back to 2 afterwards.
++ */
++static void b43_phy_ac_resetcca_rev1(struct b43_wldev *dev)
++{
++	u16 bbcfg;
++	bool exact_target;
++
++	exact_target =
++		dev->dev->bus_type == B43_BUS_BCMA &&
++		dev->dev->chip_id == 0x4360 &&
++		dev->dev->core_rev == 42 &&
++		dev->phy.type == B43_PHYTYPE_AC &&
++		dev->phy.rev == 1 &&
++		dev->phy.radio_ver == 0x2069 &&
++		dev->phy.radio_rev == 4;
++
++	b43_phy_force_clock(dev, true);
++
++	if (exact_target)
++		b43_write16(dev, 0x0492, 0x0006);
++
++	bbcfg = b43_phy_read(dev, 0x0001);
++	b43_phy_write(dev, 0x0001, bbcfg | 0x4000);
++	udelay(1);
++	b43_phy_write(dev, 0x0001, bbcfg & (u16)~0x4000);
++
++	if (exact_target)
++		b43_write16(dev, 0x0492, 0x0002);
++
++	b43_phy_force_clock(dev, false);
++	udelay(2);
++}
++
++/*
++ * One-time AC-PHY rev 1 state before the first channel set: clear the
++ * sleep-ready mailbox (shared memory 0x0184), AFE power-up of the 0x17xx
++ * register bank and the data set's initialisation tables.
++ */
++void b43_phy_ac_bcm4360_base_init_rev1(struct b43_wldev *dev)
++{
++	struct b43_phy_ac *ac = dev->phy.ac;
++	u16 afe_cfg2;
++	u16 afe_override;
++
++	if (!ac)
++		return;
++
++	if (ac->bcm4360_rev1_base_init_done)
++		return;
++
++	/* Clear the sleep-ready mailbox before the first channel set. */
++	b43_shm_write16(dev, B43_SHM_SHARED, 0x0184, 0x0000);
++
++	b43_phy_set(dev, 0x01b0, 0x8000);
++
++	/* 0x0410 = 0x0077 only while the 0x17xx bank is cleared. */
++	b43_phy_write(dev, 0x0410, 0x0077);
++
++	b43_phy_write(dev, 0x173e, 0x0000);
++	b43_phy_write(dev, 0x1725, 0x0000);
++	b43_phy_write(dev, 0x1722, 0x0000);
++	b43_phy_write(dev, 0x1723, 0x0000);
++	b43_phy_write(dev, 0x1724, 0x0000);
++	b43_phy_write(dev, 0x1725, 0x0000);
++	b43_phy_write(dev, 0x1726, 0x0000);
++	b43_phy_write(dev, 0x1727, 0x0000);
++	b43_phy_write(dev, 0x1750, 0x0000);
++
++	b43_phy_write(dev, 0xffff, 0x0000);
++	b43_phy_write(dev, 0x0410, 0x0000);
++
++	/* AFE powered up. */
++	b43_phy_write(dev, 0x1728, 0x0080);
++	b43_phy_write(dev, 0x1720, 0x0180);
++	b43_phy_write(dev, 0x1729, 0x0000);
++	b43_phy_write(dev, 0x1721, 0x5000);
++
++	/*
++	 * Copy core 0 AFE configuration into the 0x17xx bank:
++	 *   0x173a = 0x073a | 0x0100
++	 *   0x1725 = 0x0725 | 0x0400
++	 */
++	afe_cfg2 = b43_phy_read(dev, 0x073a);
++	b43_phy_write(dev, 0x173a, afe_cfg2 | 0x0100);
++
++	afe_override = b43_phy_read(dev, 0x0725);
++	b43_phy_write(dev, 0x1725, afe_override | 0x0400);
++
++	b43_phy_ac_tables_init(dev);
++
++	b43_phy_write(dev, 0x1645, 0x025c);
++
++	ac->bcm4360_rev1_base_init_done = true;
++}
++
++/*
++ * Receive-related register settings for 2.4 GHz, 20 MHz: NB clip count,
++ * IQ ADC clamp, 20 MHz primary channel and static ACI thresholds.
++ */
++static void b43_phy_ac_bcm4360_f4_rx_target_rev1(struct b43_wldev *dev)
++{
++	static const u16 fastagc_clipcnt[3] = {
++		0x06ef, 0x08ef, 0x0aef
++	};
++	static const u16 afe_override[3] = {
++		0x0725, 0x0925, 0x0b25
++	};
++	static const u16 afe_core_cfg2[3] = {
++		0x073a, 0x093a, 0x0b3a
++	};
++	unsigned int core;
++
++	/* 20 MHz: NB clip count threshold 15 on all three cores. */
++	for (core = 0; core < 3; core++)
++		b43_phy_maskset(dev, fastagc_clipcnt[core],
++				(u16)~0x00ff, 0x000f);
++
++	/*
++	 * Below 80 MHz: IQ ADC clamp enabled in the RF-control override
++	 * and core AFE configuration.
++	 */
++	for (core = 0; core < 3; core++) {
++		b43_phy_maskset(dev, afe_override[core],
++				(u16)~0x0200, 0x0200);
++		b43_phy_maskset(dev, afe_core_cfg2[core],
++				(u16)~0x0080, 0x0080);
++	}
++
++	/* 20 MHz primary-channel selection. */
++	b43_phy_maskset(dev, 0x0164,
++			(u16)~0x0010, 0x0000);
++	b43_phy_maskset(dev, 0x030f,
++			(u16)~0xc000, 0x0000);
++
++	/* Static ACI thresholds, 2.4 GHz. */
++	b43_phy_write(dev, 0x031c, 0x00ff);
++	b43_phy_write(dev, 0x031d, 0x00ff);
++	b43_phy_write(dev, 0x031e, 0x00ff);
++	b43_phy_write(dev, 0x031f, 0x00ff);
++}
++
++/*
++ * Write three 8-bit entries of AC-PHY table 4 with RxFeCtrl1.disable_stalls
++ * (0x019e bit 1) held for the duration of the transaction.
++ */
++static void
++b43_phy_ac_bcm4360_table4_write8(struct b43_wldev *dev,
++				 u16 offset,
++				 const u8 data[3])
++{
++	u16 stall_save;
++
++	stall_save = b43_phy_read(dev, 0x019e);
++
++	b43_phy_set(dev, 0x019e, 0x0002);
++
++	b43_phy_ac_table_write_bulk(dev, 0x0004, offset, 8, 3, data);
++
++	b43_phy_maskset(dev, 0x019e, (u16)~0x0002, stall_save & 0x0002);
++}
++
++/* RX EVM shaping entries of table 4 (2.4 GHz, 20 MHz), when supplied. */
++static void
++b43_phy_ac_bcm4360_rxevm8_rev1(struct b43_wldev *dev)
++{
++	const struct b43_bcm4360_rx_evm *evm = dev->bcm4360_data->rx_evm;
++
++	if (!evm || !dev->phy.ac ||
++	    !dev->wl->hw->conf.chandef.chan ||
++	    b43_current_band(dev->wl) != NL80211_BAND_2GHZ ||
++	    (dev->wl->hw->conf.chandef.width != NL80211_CHAN_WIDTH_20 &&
++	     dev->wl->hw->conf.chandef.width != NL80211_CHAN_WIDTH_20_NOHT))
++		return;
++
++	b43_phy_ac_bcm4360_table4_write8(dev, 0x0001, evm->lo);
++	b43_phy_ac_bcm4360_table4_write8(dev, 0x003d, evm->hi);
++}
++
++/*
++ * Receive Farrow resampler and SFO (PHY_BW1a..BW6) programming, 2.4 GHz,
++ * 20 MHz.  The phase increment comes from the data set's Farrow rows; the
++ * six SFO words are words 52..57 of the channel's BCM2069 channel row.
++ * Drift period 0x1400 and control 0x00a7 are the same on all channels; the
++ * loopback resampler uses the same values.
++ */
++static void
++b43_phy_ac_bcm4360_rx_farrow_sfo_rev1(struct b43_wldev *dev,
++				      unsigned int channel)
++{
++	const struct b43_bcm4360_data *data = dev->bcm4360_data;
++	const u16 *sfo;
++	u16 lo, hi;
++	unsigned int i;
++
++	if (!dev->phy.ac ||
++	    !dev->wl->hw->conf.chandef.chan ||
++	    b43_current_band(dev->wl) != NL80211_BAND_2GHZ ||
++	    channel < 1 || channel > 14 ||
++	    (dev->wl->hw->conf.chandef.width != NL80211_CHAN_WIDTH_20 &&
++	     dev->wl->hw->conf.chandef.width != NL80211_CHAN_WIDTH_20_NOHT))
++		return;
++
++	lo = data->farrow_2g[channel - 1].deltaphase_lo;
++	hi = data->farrow_2g[channel - 1].deltaphase_hi;
++	sfo = &data->chan_2g[channel - 1][52];
++
++	b43_phy_write(dev, 0x019a, lo);
++	b43_phy_write(dev, 0x019b, hi);
++	b43_phy_write(dev, 0x019c, 0x1400);
++	b43_phy_write(dev, 0x0199, 0x00a7);
++
++	b43_phy_write(dev, 0x01a1, lo);
++	b43_phy_write(dev, 0x01a2, hi);
++	b43_phy_write(dev, 0x01a3, 0x1400);
++	b43_phy_write(dev, 0x01a0, 0x00a7);
++
++	for (i = 0; i < 6; i++)
++		b43_phy_write(dev, 0x0371 + i, sfo[i]);
++}
++
++/*
++ * Channel change (2.4 GHz, 20 MHz only).
++ *
++ * The whole transaction runs with the PHY held in carrier search and the
++ * RX FIFO held: data-set channel tables, LOGEN reset, BCM2069 channel row,
++ * RFPLL setup and VCO calibration; then, with RX stalls disabled, the
++ * per-core W2NB/HWACI bits and table 12 state; RX LPF, RX EVM, receive
++ * settings, Farrow/SFO, receive gains, CCA reset and per-core radio
++ * calibration; finally the RX baseband setup.  The post-init block runs
++ * after carrier search is released.
++ *
++ * Before mac80211 has configured a channel (early attach) only the
++ * BCM4360 target is accepted and the gain/calibration steps are skipped.
++ */
++static int b43_phy_ac_op_switch_channel(struct b43_wldev *dev,
++					unsigned int new_channel)
++{
++	bool carrier_owned_here;
++	bool normal_rx_init = false;
++	bool rxfe_hold_active = false;
++	u16 rxfe_saved_stall = 0;
++	u16 rxfe_saved_fifo = 0;
++
++	u8 lpf_a;
++	u8 lpf_b;
++	u16 lpf_g0;
++	u16 lpf_g12;
++	int err;
++
++	if (dev->wl->hw->conf.chandef.chan) {
++		if (b43_current_band(dev->wl) != NL80211_BAND_2GHZ)
++			return -EOPNOTSUPP;
++	} else if (dev->dev->chip_id != 0x4360 ||
++		   dev->phy.rev != 1 ||
++		   dev->phy.radio_ver != 0x2069 ||
++		   dev->phy.radio_rev != 4) {
++		return -EOPNOTSUPP;
++	}
++
++	if (new_channel < 1 || new_channel > 14)
++		return -EINVAL;
++
++	if (dev->phy.rev != 1 ||
++	    dev->phy.radio_ver != 0x2069 ||
++	    dev->phy.radio_rev != 4)
++		return -EOPNOTSUPP;
++
++	b43_phy_ac_bcm4360_base_init_rev1(dev);
++
++	/* Data-set tables written on every channel set, before the radio. */
++	{
++		const struct b43_bcm4360_data *data = dev->bcm4360_data;
++		unsigned int i;
++
++		for (i = 0; i < data->n_chan_tables; i++)
++			b43_phy_ac_table_write_bulk(dev,
++						    data->chan_tables[i].id,
++						    data->chan_tables[i].offset,
++						    data->chan_tables[i].width,
++						    data->chan_tables[i].count,
++						    data->chan_tables[i].data);
++	}
++
++	/*
++	 * Hold the RX FIFO (0x019e bit 0) across the radio channel
++	 * programming.  The RX core mask is not changed; on this device all
++	 * three cores stay enabled (PHY 0x401 = 0x7777).
++	 */
++	{
++		u16 rxfe_before;
++
++		rxfe_before = b43_phy_read(dev, 0x019e);
++		rxfe_saved_stall = rxfe_before & 0x0002;
++		rxfe_saved_fifo = rxfe_before & 0x0001;
++
++		b43_phy_maskset(dev, 0x019e,
++				(u16)~0x0001, 0x0001);
++
++		rxfe_hold_active = true;
++	}
++
++	/*
++	 * PHY 0x0003 bit 8 is deliberately not set here: with it, no frame
++	 * is received on this device.
++	 */
++
++	/* Carrier search for the whole channel transaction (not nested). */
++	carrier_owned_here = !dev->phy.ac->carrier_search_depth;
++	if (carrier_owned_here)
++		b43_phy_ac_bcm4360_stay_in_carrier_search_rev1(dev, true);
++
++	/*
++	 * LOGEN reset (RfctrlCoreTxPus0 0x0728 bit 8) around the channel
++	 * row; bit 7 is LOGEN power-up.
++	 */
++	{
++		u16 logen_before;
++		u16 logen_asserted;
++
++		logen_before = b43_phy_read(dev, 0x0728);
++		b43_phy_write(dev, 0x0728,
++			      logen_before | 0x0100);
++		udelay(1);
++
++		logen_asserted = b43_phy_read(dev, 0x0728);
++		b43_phy_write(dev, 0x0728,
++			      logen_asserted & 0xfeff);
++	}
++
++	err = b43_radio_2069_tune_rev4_2g(dev, new_channel);
++	if (err)
++		goto out_carrier;
++
++	b43_radio_2069_rfpll_setup_rev4_2g20(dev);
++	b43_radio_2069_vcocal_rev4(dev);
++
++	b43_phy_maskset(dev, 0x019e,
++			(u16)~0x0001, rxfe_saved_fifo);
++
++	rxfe_hold_active = false;
++
++	/*
++	 * Disable RX stalls (0x019e bit 1) for the channel-state block below;
++	 * the incoming value, saved above, is restored after it.
++	 */
++	b43_phy_maskset(dev, 0x019e,
++			(u16)~0x0002, 0x0002);
++
++	/* RfctrlCoreRxPus bit 12 per core (0x0729 + (core << 9)). */
++	{
++		u8 core_count = b43_radio_2069_core_count(dev);
++		unsigned int core;
++
++		if (core_count > 3) {
++			b43warn(dev->wl,
++				"BCM4360: unexpected BCM2069 core count %u\n",
++				core_count);
++		} else {
++			for (core = 0; core < core_count; core++) {
++				u16 base = (u16)core << 9;
++				u16 reg = 0x0729 + base;
++
++				b43_phy_maskset(dev, reg,
++						(u16)~0x1000, 0x1000);
++			}
++		}
++	}
++
++	/* WRSSI3 bit 11 per core (0x0728 + (core << 9)). */
++	{
++		u8 core_count = b43_radio_2069_core_count(dev);
++		unsigned int core;
++
++		if (core_count > 3) {
++			b43warn(dev->wl,
++				"BCM4360: unexpected BCM2069 core count %u\n",
++				core_count);
++		} else {
++			for (core = 0; core < core_count; core++) {
++				u16 base = (u16)core << 9;
++				u16 reg = 0x0728 + base;
++
++				b43_phy_maskset(dev, reg,
++						(u16)~0x0800, 0x0800);
++			}
++		}
++	}
++
++	/*
++	 * Table 12: clear entries 0x60..0x62 of core 0, 0x64..0x66 of
++	 * core 1 and 0x68..0x6a of core 2.
++	 */
++	{
++		static const u16 zero_pair[2] = {
++			0x0000, 0x0000
++		};
++		static const u16 zero_single;
++		u8 core_count = b43_radio_2069_core_count(dev);
++		unsigned int core;
++
++		if (core_count != 3) {
++			b43warn(dev->wl,
++				"BCM4360: unexpected BCM2069 core count %u\n",
++				core_count);
++		} else {
++			for (core = 0; core < core_count; core++) {
++				u16 offset = 0x0060 + (core * 4);
++
++				b43_phy_ac_table_write_bulk(dev, 12, offset,
++							    16, 2, zero_pair);
++
++				b43_phy_ac_table_write_bulk(dev, 12, offset + 2,
++							    16, 1, &zero_single);
++			}
++		}
++	}
++
++	/* Radio registers 0x002..0x005 of every core cleared next. */
++	{
++		u8 core_count = b43_radio_2069_core_count(dev);
++		unsigned int core;
++
++		if (core_count != 3) {
++			b43warn(dev->wl,
++				"BCM4360: unexpected BCM2069 core count %u\n",
++				core_count);
++		} else {
++			for (core = 0; core < core_count; core++) {
++				u16 bank = (u16)core << 9;
++
++				b43_radio_write(dev, bank | 0x0002, 0x0000);
++				b43_radio_write(dev, bank | 0x0003, 0x0000);
++				b43_radio_write(dev, bank | 0x0004, 0x0000);
++				b43_radio_write(dev, bank | 0x0005, 0x0000);
++			}
++		}
++	}
++
++	/* PHY registers 0x6a0/0x6a1 of every core cleared next. */
++	{
++		u8 core_count = b43_radio_2069_core_count(dev);
++		unsigned int core;
++
++		if (core_count != 3) {
++			b43warn(dev->wl,
++				"BCM4360: unexpected BCM2069 core count %u\n",
++				core_count);
++		} else {
++			for (core = 0; core < core_count; core++) {
++				u16 bank = (u16)core << 9;
++
++				b43_phy_write(dev, 0x06a0 + bank, 0x0000);
++				b43_phy_write(dev, 0x06a1 + bank, 0x0000);
++			}
++		}
++	}
++
++	/* End of the RX-stall hold. */
++	b43_phy_maskset(dev, 0x019e,
++			(u16)~0x0002,
++			rxfe_saved_stall);
++
++	/*
++	 * RX LPF groups 1, 2 and 4 from the analog calibration results;
++	 * the RX core mask stays unchanged (all three cores).
++	 */
++	if (dev->wl->hw->conf.chandef.chan) {
++		lpf_a = dev->phy.ac->radio2069_cal_lpf_a;
++		lpf_b = dev->phy.ac->radio2069_cal_lpf_b;
++
++		lpf_g0 = ((u16)221 * lpf_a) >> 8;
++		lpf_g12 = ((u16)215 * lpf_a) >> 8;
++
++		if (!b43_phy_ac_rx_lpf_update(dev, 0x01, 0x07,
++					      lpf_g0, lpf_b) ||
++		    !b43_phy_ac_rx_lpf_update(dev, 0x02, 0x07,
++					      lpf_g12, lpf_b) ||
++		    !b43_phy_ac_rx_lpf_update(dev, 0x04, 0x07,
++					      lpf_g12, lpf_b)) {
++			b43err(dev->wl,
++			       "BCM4360: RX LPF update failed\n");
++			err = -EIO;
++			goto out_carrier;
++		}
++	}
++
++	b43_phy_ac_bcm4360_rxevm8_rev1(dev);
++
++	b43_phy_ac_bcm4360_f4_rx_target_rev1(dev);
++
++	/* Per-channel RX Farrow / SFO coefficients. */
++	b43_phy_ac_bcm4360_rx_farrow_sfo_rev1(dev, new_channel);
++
++	/* Receive gains, CCA reset, then per-core radio calibration. */
++	if (dev->wl->hw->conf.chandef.chan) {
++		b43_phy_ac_bcm4360_pre_afecal_rxgain_rev1(dev);
++		b43_phy_ac_resetcca_rev1(dev);
++		udelay(1);
++
++		err = b43_radio_2069_calibrate_per_core_rev4(dev);
++		if (err) {
++			b43err(dev->wl,
++			       "BCM2069 rev4 channel %u per-core calibration failed: %d\n",
++			       new_channel, err);
++			goto out_carrier;
++		}
++	}
++
++	/* RX baseband setup, still inside the carrier-search window. */
++	if (dev->wl->hw->conf.chandef.chan) {
++		b43_phy_ac_bcm4360_rx_rev1_prepare(dev);
++
++		normal_rx_init = true;
++	}
++
++	err = 0;
++
++out_carrier:
++	/* Error path: release the RX front-end hold. */
++	if (rxfe_hold_active) {
++		b43_phy_maskset(dev, 0x019e,
++				(u16)~0x0001, rxfe_saved_fifo);
++
++		rxfe_hold_active = false;
++	}
++	if (carrier_owned_here)
++		b43_phy_ac_bcm4360_stay_in_carrier_search_rev1(dev, false);
++
++	/* Post-init block: must run after the RX baseband setup. */
++	if (!err && normal_rx_init) {
++		if (!b43_phy_ac_bcm4360_post_init_rev1(dev)) {
++			b43err(dev->wl,
++			       "BCM4360: post-init failed\n");
++			err = -EIO;
++		}
++	}
++
++	return err;
++}
++
++static void b43_phy_ac_op_switch_analog(struct b43_wldev *dev, bool on)
++{
++	b43_phyop_switch_analog_generic(dev, on);
++}
++
++/*
++ * AC-PHY classifier control: replace only the requested bits, and write
++ * back even when mask is zero.
++ */
++u16 b43_phy_ac_classifier(struct b43_wldev *dev, u16 mask, u16 value)
++{
++	u16 ctl;
++
++	ctl = b43_phy_read(dev, B43_PHY_AC_CLASSCTL);
++
++	ctl = (ctl & ~mask) | (value & mask);
++	b43_phy_write(dev, B43_PHY_AC_CLASSCTL, ctl);
++
++	return ctl;
++}
++
++/*
++ * Enable or disable OFDM carrier sensing: bit 0x0010 of PHY registers
++ * 0x2ed, 0x2f1, 0x2f5 and 0x2f9.
++ */
++void b43_phy_ac_ofdm_crs(struct b43_wldev *dev, bool enable)
++{
++	u16 value = enable ? 0x0010 : 0x0000;
++
++	b43_phy_maskset(dev, 0x02ed, (u16)~0x0010, value);
++	b43_phy_maskset(dev, 0x02f1, (u16)~0x0010, value);
++	b43_phy_maskset(dev, 0x02f5, (u16)~0x0010, value);
++	b43_phy_maskset(dev, 0x02f9, (u16)~0x0010, value);
++}
++
+ const struct b43_phy_operations b43_phyops_ac = {
++	.init			= b43_phy_ac_op_init,
++	.software_rfkill	= b43_phy_ac_op_software_rfkill,
++	.switch_channel		= b43_phy_ac_op_switch_channel,
+ 	.allocate		= b43_phy_ac_op_allocate,
+ 	.free			= b43_phy_ac_op_free,
++	.prepare_structs	= b43_phy_ac_op_prepare_structs,
+ 	.phy_maskset		= b43_phy_ac_op_maskset,
+ 	.radio_read		= b43_phy_ac_op_radio_read,
+ 	.radio_write		= b43_phy_ac_op_radio_write,
+ 	.get_default_chan	= b43_phy_ac_op_get_default_chan,
+ 	.recalc_txpower		= b43_phy_ac_op_recalc_txpower,
+ 	.adjust_txpower		= b43_phy_ac_op_adjust_txpower,
++	.switch_analog		= b43_phy_ac_op_switch_analog,
+ };
++
++/*
++ * Per-core clip gate for AC-PHY revisions other than 0: false sets
++ * PHY[0x6d4 + core * 0x200] bit 0x4000, true clears it.  Revision 0 uses
++ * a different mechanism and is not handled.
++ */
++void b43_phy_ac_carrier_core_gate_nonzero_rev(struct b43_wldev *dev,
++					      bool restore)
++{
++	u8 core_count;
++	u8 core;
++
++	if (!dev->phy.rev)
++		return;
++
++	core_count = b43_radio_2069_core_count(dev);
++
++	for (core = 0; core < core_count; core++) {
++		u16 reg = 0x06d4 + ((u16)core << 9);
++
++		if (restore)
++			b43_phy_mask(dev, reg, ~0x4000);
++		else
++			b43_phy_set(dev, reg, 0x4000);
++	}
++}
++
++/*
++ * Nested stay-in-carrier-search control.
++ *
++ * Enter at depth 0: classifier mask 7 -> 4, OFDM CRS off, per-core clip
++ * gate set, PHY 0x339 = 0.  Every enter: depth++, CCA reset.
++ *
++ * Exit: depth--; at depth 0 restore the classifier (7 on 2.4 GHz, 6 on
++ * 5 GHz), OFDM CRS on, clip gate cleared and PHY 0x339 (0x0fff).  There is
++ * no CCA reset on the final exit.  An unbalanced exit is ignored with a
++ * warning.
++ */
++void b43_phy_ac_bcm4360_stay_in_carrier_search_rev1(struct b43_wldev *dev,
++						    bool enable)
++{
++	struct b43_phy_ac *phy_ac = dev->phy.ac;
++	u16 classifier_restore;
++
++	if (enable) {
++		if (!phy_ac->carrier_search_depth) {
++			b43_phy_ac_classifier(dev, 0x0007, 0x0004);
++			b43_phy_ac_ofdm_crs(dev, false);
++			b43_phy_ac_carrier_core_gate_nonzero_rev(dev, false);
++			b43_phy_write(dev, 0x0339, 0x0000);
++		}
++
++		phy_ac->carrier_search_depth++;
++		b43_phy_ac_resetcca_rev1(dev);
++		return;
++	}
++
++	if (!phy_ac->carrier_search_depth) {
++		b43warn(dev->wl,
++			"BCM4360 AC-PHY unbalanced carrier-search exit\n");
++		return;
++	}
++
++	phy_ac->carrier_search_depth--;
++
++	if (phy_ac->carrier_search_depth)
++		return;
++
++	/* Without a chandef yet (2.4 GHz only device) the classifier value is 7. */
++	if (!dev->wl->hw->conf.chandef.chan)
++		classifier_restore = 0x0007;
++	else
++		classifier_restore =
++			b43_current_band(dev->wl) == NL80211_BAND_2GHZ ?
++			0x0007 : 0x0006;
++
++	b43_phy_ac_classifier(dev, 0x0007, classifier_restore);
++	b43_phy_ac_ofdm_crs(dev, true);
++	b43_phy_ac_carrier_core_gate_nonzero_rev(dev, true);
++	b43_phy_write(dev, 0x0339,
++		      phy_ac->carrier_search_339_restore);
++}
++
++static bool b43_phy_ac_is_bcm4360_rx(struct b43_wldev *dev)
++{
++	return dev->phy.ac && dev->bcm4360_board &&
++	       b43_radio_2069_core_count(dev) == dev->bcm4360_board->cores;
++}
++
++/*
++ * Post-channel state: energy-detect thresholds and the rev 1 tail.  No
++ * idle-TSSI measurement (TX power control) is performed: it transmits a
++ * tone, and this driver is receive-only.
++ */
++bool b43_phy_ac_bcm4360_post_init_rev1(struct b43_wldev *dev)
++{
++	if (!b43_phy_ac_is_bcm4360_rx(dev))
++		return false;
++
++	/* Energy-detect thresholds: baseline values first... */
++	b43_phy_write(dev, 0x033a, 0x03ac);
++	b43_phy_write(dev, 0x033b, 0x03ac);
++	b43_phy_write(dev, 0x033e, 0x03ac);
++	b43_phy_write(dev, 0x033f, 0x03ac);
++	b43_phy_write(dev, 0x0342, 0x03ac);
++	b43_phy_write(dev, 0x0343, 0x03ac);
++	b43_phy_write(dev, 0x0346, 0x03ac);
++	b43_phy_write(dev, 0x0347, 0x03ac);
++
++	b43_phy_write(dev, 0x033c, 0x032c);
++	b43_phy_write(dev, 0x033d, 0x032c);
++	b43_phy_write(dev, 0x0340, 0x032c);
++	b43_phy_write(dev, 0x0341, 0x032c);
++	b43_phy_write(dev, 0x0344, 0x032c);
++	b43_phy_write(dev, 0x0345, 0x032c);
++	b43_phy_write(dev, 0x0348, 0x032c);
++	b43_phy_write(dev, 0x0349, 0x032c);
++
++	/* ...then the -69 dBm default (0x03bf / 0x0340). */
++	b43_phy_write(dev, 0x033a, 0x03bf);
++	b43_phy_write(dev, 0x033b, 0x03bf);
++	b43_phy_write(dev, 0x033e, 0x03bf);
++	b43_phy_write(dev, 0x033f, 0x03bf);
++	b43_phy_write(dev, 0x0342, 0x03bf);
++	b43_phy_write(dev, 0x0343, 0x03bf);
++	b43_phy_write(dev, 0x0346, 0x03bf);
++	b43_phy_write(dev, 0x0347, 0x03bf);
++
++	b43_phy_write(dev, 0x033c, 0x0340);
++	b43_phy_write(dev, 0x033d, 0x0340);
++	b43_phy_write(dev, 0x0340, 0x0340);
++	b43_phy_write(dev, 0x0341, 0x0340);
++	b43_phy_write(dev, 0x0344, 0x0340);
++	b43_phy_write(dev, 0x0345, 0x0340);
++	b43_phy_write(dev, 0x0348, 0x0340);
++	b43_phy_write(dev, 0x0349, 0x0340);
++
++	/* Rev 1 tail. */
++	b43_phy_write(dev, 0x016e, 0x0013);
++	b43_phy_write(dev, 0x016f, 0x07d0);
++	b43_phy_write(dev, 0x0170, 0x07d0);
++
++	return true;
++}
+--- a/drivers/net/wireless/broadcom/b43/phy_ac.h
++++ b/drivers/net/wireless/broadcom/b43/phy_ac.h
+@@ -32,8 +32,53 @@
+ #define  B43_PHY_AC_C3_CLIP_DIS			0x4000
+ 
+ struct b43_phy_ac {
++	/*
++	 * BCM2069 analog-calibration results: two RX LPF values and the
++	 * DAC-buffer value (see b43_radio_2069_calibrate_analog_rev4_class0()).
++	 */
++	u8 radio2069_cal_lpf_a;
++	u8 radio2069_cal_lpf_b;
++	u8 radio2069_cal_dacbuf;
++
++	/* One-time rev 1 base state (b43_phy_ac_bcm4360_base_init_rev1) done. */
++	bool bcm4360_rev1_base_init_done;
++
++	/*
++	 * software_rfkill() is a void b43 callback, so radio power-up failures
++	 * cannot be returned directly through it.  Preserve the error here and
++	 * let the immediately following AC-PHY init callback propagate it into
++	 * b43_phy_init().
++	 */
++	int radio2069_init_error;
++
++	/*
++	 * Stay-in-carrier-search nesting depth and the PHY 0x339 value
++	 * restored when the outermost level exits.
++	 */
++	u32 carrier_search_depth;
++	u16 carrier_search_339_restore;
+ };
+ 
+ extern const struct b43_phy_operations b43_phyops_ac;
+ 
++/* AC-PHY RX LPF (RF-sequencer table 7) field update. */
++bool b43_phy_ac_rx_lpf_update(struct b43_wldev *dev, u8 groups,
++			      u8 rx_mask, u16 field6, u16 field17);
++
++u16 b43_phy_ac_classifier(struct b43_wldev *dev, u16 mask, u16 value);
++void b43_phy_ac_ofdm_crs(struct b43_wldev *dev, bool enable);
++
++void b43_phy_ac_bcm4360_rx_rev1_prepare(struct b43_wldev *dev);
++
++void b43_phy_ac_carrier_core_gate_nonzero_rev(struct b43_wldev *dev,
++					      bool restore);
++
++/* BCM4360 / AC-PHY rev 1 stay-in-carrier-search nesting control. */
++void b43_phy_ac_bcm4360_stay_in_carrier_search_rev1(struct b43_wldev *dev,
++						    bool enable);
++
++void b43_phy_ac_bcm4360_base_init_rev1(struct b43_wldev *dev);
++
++bool b43_phy_ac_bcm4360_post_init_rev1(struct b43_wldev *dev);
++
+ #endif /* B43_PHY_AC_H_ */

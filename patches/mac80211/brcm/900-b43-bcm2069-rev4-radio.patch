@@ -1,0 +1,703 @@
+From: Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
+Subject: [PATCH] b43: add BCM2069 rev 4 radio support (BCM4360, 2.4 GHz)
+
+Radio power-up, reference and analog calibration, per-core calibration,
+VCO calibration and 2.4 GHz channel tuning for the BCM2069 rev 4 radio
+of the BCM4360.  Channel rows and radio register defaults are taken from
+the BCM4360 hardware data set (bcm4360.h).
+---
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/radio_2069.c
+@@ -0,0 +1,667 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Broadcom B43 wireless driver
++ * Broadcom 2069 radio support (revision 4, 2.4 GHz)
++ *
++ * Copyright (c) 2026 Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
++ *
++ * Radio power-up, reference/RC calibration, analog calibration, VCO
++ * calibration and 2.4 GHz channel tuning for the BCM2069 rev 4 radio of
++ * the BCM4360.  Channel rows and radio defaults come from the BCM4360
++ * data set (bcm4360.h).
++ */
++
++#include <linux/delay.h>
++#include <linux/kernel.h>
++
++#include "b43.h"
++#include "phy_ac.h"
++#include "radio_2069.h"
++#include "bcm4360.h"
++
++/* Update the bits selected by mask to value. */
++static void b43_radio_2069_mod(struct b43_wldev *dev, u16 reg,
++			       u16 mask, u16 value)
++{
++	b43_radio_maskset(dev, reg, (u16)~mask, value);
++}
++
++/* Number of AC-PHY radio cores: PHY[0x00b] bits 2:0. */
++u8 b43_radio_2069_core_count(struct b43_wldev *dev)
++{
++	return b43_phy_read(dev, 0x000b) & 0x0007;
++}
++
++/*
++ * PLL/LOGEN setup after the channel row, 2.4 GHz, 20 MHz.  The channel row
++ * already programs the PLL and VCO words (including the feedback divider
++ * in 0x8c9/0x8cc); only two settings remain: NBRSSI reference ladder 7 and
++ * ADC_CFG5.
++ */
++void b43_radio_2069_rfpll_setup_rev4_2g20(struct b43_wldev *dev)
++{
++	b43_radio_maskset(dev, 0x645, (u16)~0x7000, 0x7000);
++	b43_radio_write(dev, 0x723, 0x83e0);
++}
++
++/*
++ * VCO calibration:
++ *
++ *   PLL_VCOCAL10 override mode = 0
++ *   PLL_CFG2 reset, PLL_VCOCAL13 reset, PLL_VCOCAL1 cal = 0
++ *   delay 11 us
++ *   release both resets, delay 1 us
++ *   PLL_VCOCAL1 cal = 1
++ *   poll PLL_VCOCAL14 done (bounded), then settle 120 us
++ *
++ * Registers are in the radio PLL page (0x08xx).
++ */
++void b43_radio_2069_vcocal_rev4(struct b43_wldev *dev)
++{
++	bool done = false;
++	unsigned int itr;
++	u16 status = 0;
++
++	if (dev->phy.radio_ver != 0x2069 || dev->phy.radio_rev != 4) {
++		b43warn(dev->wl,
++			"BCM2069 VCOCAL called for unsupported radio 0x%04x rev %u\n",
++			dev->phy.radio_ver, dev->phy.radio_rev);
++		return;
++	}
++
++	/* Legacy VCO calibration mode. */
++	b43_radio_2069_mod(dev, 0x08e5, 0x4000, 0x0000);
++
++	/* Reset and calibration trigger low. */
++	b43_radio_2069_mod(dev, 0x08d0, 0x0001, 0x0000);
++	b43_radio_2069_mod(dev, 0x08e8, 0x0040, 0x0000);
++	b43_radio_2069_mod(dev, 0x08dc, 0x2000, 0x0000);
++
++	udelay(11);
++
++	/* Release resets. */
++	b43_radio_2069_mod(dev, 0x08d0, 0x0001, 0x0001);
++	b43_radio_2069_mod(dev, 0x08e8, 0x0040, 0x0040);
++
++	udelay(1);
++
++	/* Start VCO calibration. */
++	b43_radio_2069_mod(dev, 0x08dc, 0x2000, 0x2000);
++
++	/* Bounded poll; a timeout is reported but not fatal. */
++	for (itr = 0; itr < 100; itr++) {
++		udelay(10);
++
++		status = b43_radio_read(dev, 0x090b);
++
++		if (status & 0x0100) {
++			done = true;
++			break;
++		}
++	}
++
++	/* Settling time, also after completion was observed. */
++	udelay(120);
++
++	if (!done)
++		b43warn(dev->wl,
++			"BCM2069 rev4 VCO calibration completion not observed after 100 polls (status=0x%04x); continuing\n",
++			status);
++}
++
++/*
++ * Per-core radio calibration, run at the end of a channel change.
++ *
++ * For every AC-PHY core: save the temporary PHY state, trigger the core
++ * calibration, poll its two completion bits (bounded), and restore the
++ * saved PHY/radio state.  Radio revisions above 3 need nothing after
++ * the per-core loop.
++ */
++int b43_radio_2069_calibrate_per_core_rev4(struct b43_wldev *dev)
++{
++	u8 core_count = b43_radio_2069_core_count(dev);
++	u16 chip = dev->dev->chip_id;
++	u8 core;
++
++	if (dev->phy.radio_ver != 0x2069 || dev->phy.radio_rev != 4)
++		return -EOPNOTSUPP;
++
++	if (chip != 0x4352 && chip != 0x4360 &&
++	    chip != 0xa9c4 && chip != 0xaa06)
++		return -EOPNOTSUPP;
++
++	/* The register banks below exist for cores 0..2 only. */
++	if (!core_count || core_count > 3) {
++		b43err(dev->wl,
++		       "BCM2069 invalid rev4 calibration core count: %u\n",
++		       core_count);
++		return -EINVAL;
++	}
++
++	/* AFE calibration enabled around the whole core loop. */
++	b43_radio_2069_mod(dev, 0x08ea, 0x0080, 0x0080);
++
++	for (core = 0; core < core_count; core++) {
++		u16 bank = (u16)core << 9;
++		u16 phy_739 = 0x0739 + bank;
++		u16 phy_73a = 0x073a + bank;
++		u16 phy_725 = 0x0725 + bank;
++		u16 radio_121 = 0x0121 | bank;
++		u16 radio_122 = 0x0122 | bank;
++		u16 radio_144 = 0x0144 | bank;
++		u16 saved_phy_739;
++		u16 saved_phy_73a;
++		u16 saved_phy_725;
++		u16 saved_radio_122;
++		bool done = false;
++		unsigned int poll;
++
++		/*
++		 * Save every PHY register restored below.  0x73a is not
++		 * written here but is restored as well, because the
++		 * calibration hardware may change it.
++		 */
++		saved_phy_739 = b43_phy_read(dev, phy_739);
++		saved_phy_73a = b43_phy_read(dev, phy_73a);
++		saved_phy_725 = b43_phy_read(dev, phy_725);
++
++		b43_phy_write(dev, phy_739, saved_phy_739 | 0x0080);
++		b43_phy_write(dev, phy_725, saved_phy_725 | 0x0004);
++
++		/* Calibration trigger: low, 100 us delay, high. */
++		b43_radio_2069_mod(dev, radio_121, 0x1000, 0x0000);
++		udelay(100);
++		b43_radio_2069_mod(dev, radio_121, 0x1000, 0x1000);
++
++		/*
++		 * Force the low nibble of 0x122 high during the calibration;
++		 * afterwards it is written back as saved & 0xfff0.
++		 */
++		saved_radio_122 = b43_radio_read(dev, radio_122);
++		b43_radio_write(dev, radio_122, saved_radio_122 | 0x000f);
++
++		/*
++		 * Completion: bit 1 in a first and bit 0 in a second read of
++		 * 0x144, polled every 10 us, at most ten times.
++		 */
++		for (poll = 0; poll < 10; poll++) {
++			u16 status_first;
++			u16 status_second;
++
++			udelay(10);
++
++			status_first = b43_radio_read(dev, radio_144);
++			status_second = b43_radio_read(dev, radio_144);
++
++			if ((status_second & 0x0001) &&
++			    (status_first & 0x0002)) {
++				done = true;
++				break;
++			}
++		}
++
++		/* Same epilogue whether or not completion was observed. */
++		b43_radio_write(dev, radio_122, saved_radio_122 & 0xfff0);
++
++		b43_phy_write(dev, phy_725, saved_phy_725);
++		b43_phy_write(dev, phy_739, saved_phy_739);
++		b43_phy_write(dev, phy_73a, saved_phy_73a);
++
++		/*
++		 * A missing completion does not fail the channel change;
++		 * the state is restored and the next core is calibrated.
++		 */
++		if (!done) {
++			b43warn(dev->wl,
++				"BCM2069 rev4 calibration completion not observed on core %u after 10 polls; continuing\n",
++				core);
++		}
++	}
++
++	b43_radio_2069_mod(dev, 0x08ea, 0x0080, 0x0000);
++
++	return 0;
++}
++
++struct b43_radio_2069_chan_reg {
++	u8 word;
++	u16 reg;
++};
++
++/*
++ * Radio registers programmed from a 2.4 GHz channel row: row word ->
++ * radio register.  The rows themselves (channels 1..14) come from the
++ * BCM4360 data set.
++ */
++static const struct b43_radio_2069_chan_reg
++b43_radio_2069_rev4_chan_regmap[] = {
++	{ 2, 0x08e0 },
++	{ 3, 0x08e1 },
++	{ 4, 0x08dd },
++	{ 5, 0x08dc },
++	{ 6, 0x08e6 },
++	{ 7, 0x08e7 },
++	{ 8, 0x08c4 },
++	{ 9, 0x08c5 },
++	{ 10, 0x08e5 },
++	{ 11, 0x08eb },
++	{ 12, 0x08d6 },
++	{ 13, 0x0113 },
++	{ 14, 0x08db },
++	{ 15, 0x08da },
++	{ 16, 0x08d7 },
++	{ 17, 0x0885 },
++	{ 18, 0x0886 },
++	{ 19, 0x0887 },
++	{ 20, 0x08d9 },
++	{ 21, 0x08d8 },
++	{ 22, 0x08c9 },
++	{ 23, 0x08ca },
++	{ 24, 0x08cc },
++	{ 25, 0x08c7 },
++	{ 26, 0x08c8 },
++	{ 27, 0x0892 },
++	{ 28, 0x0894 },
++	{ 29, 0x0895 },
++	{ 30, 0x0896 },
++	{ 31, 0x0897 },
++	{ 32, 0x0899 },
++	{ 33, 0x089a },
++	{ 34, 0x089b },
++	{ 35, 0x089c },
++	{ 36, 0x0112 },
++	{ 37, 0x0629 },
++	{ 38, 0x065b },
++	{ 39, 0x065e },
++	{ 40, 0x0668 },
++	{ 41, 0x011a },
++	{ 42, 0x011b },
++	{ 43, 0x0719 },
++	{ 44, 0x0630 },
++	{ 45, 0x065c },
++	{ 46, 0x0662 },
++	{ 47, 0x066d },
++	{ 48, 0x0893 },
++	{ 49, 0x0145 },
++	{ 50, 0x0146 },
++	{ 51, 0x0723 },
++};
++
++/*
++ * Program the channel row of a 2.4 GHz channel.  The surrounding
++ * RFPLL/calibration steps are issued by the AC-PHY channel callback so
++ * that failures propagate from there.
++ */
++int b43_radio_2069_tune_rev4_2g(struct b43_wldev *dev,
++				unsigned int channel)
++{
++	const u16 *row;
++	unsigned int i;
++
++	if (dev->phy.radio_ver != 0x2069 || dev->phy.radio_rev != 4)
++		return -EOPNOTSUPP;
++
++	if (channel < 1 || channel > 14)
++		return -EINVAL;
++
++	if (channel > dev->bcm4360_data->n_chan_2g)
++		return -EINVAL;
++
++	row = dev->bcm4360_data->chan_2g[channel - 1];
++
++	if (row[0] != channel)
++		return -EINVAL;
++
++	for (i = 0; i < ARRAY_SIZE(b43_radio_2069_rev4_chan_regmap); i++) {
++		const struct b43_radio_2069_chan_reg *op =
++			&b43_radio_2069_rev4_chan_regmap[i];
++		u16 value = row[op->word];
++
++		b43_radio_write(dev, op->reg, value);
++	}
++
++	return 0;
++}
++
++/* Radio power-up for the class-0 (BCM4360) front end. */
++int b43_radio_2069_power_up_rev4_class0(struct b43_wldev *dev)
++{
++	int err;
++	unsigned int itr;
++	u16 refcal_status = 0;
++
++	/* Power-up sequence before the radio defaults. */
++	b43_radio_2069_mod(dev, 0x080b, 0x0080, 0x0080);
++	b43_radio_2069_mod(dev, 0x080b, 0x0010, 0x0010);
++	b43_radio_2069_mod(dev, 0x080b, 0x0008, 0x0008);
++	b43_radio_2069_mod(dev, 0x080b, 0x0004, 0x0004);
++	b43_radio_2069_mod(dev, 0x080b, 0x0002, 0x0002);
++
++	b43_radio_2069_mod(dev, 0x097f, 0x0010, 0x0000);
++
++	b43_radio_2069_mod(dev, 0x08ea, 0x0001, 0x0001);
++	b43_radio_2069_mod(dev, 0x08ea, 0x0100, 0x0100);
++	b43_radio_2069_mod(dev, 0x08ea, 0x0010, 0x0010);
++
++	b43_radio_2069_mod(dev, 0x080b, 0x0020, 0x0020);
++	b43_radio_2069_mod(dev, 0x080b, 0x2000, 0x2000);
++	b43_radio_2069_mod(dev, 0x080b, 0x4000, 0x4000);
++
++	/* Read back before deasserting. */
++	(void)b43_radio_read(dev, 0x080b);
++	b43_radio_2069_mod(dev, 0x080b, 0x4000, 0x0000);
++	b43_radio_2069_mod(dev, 0x080b, 0x2000, 0x0000);
++
++	b43_radio_write(dev, 0x060c, 0x009e);
++	b43_radio_write(dev, 0x060c, 0x00be);
++	b43_radio_write(dev, 0x060c, 0x20be);
++	b43_radio_write(dev, 0x060c, 0x60be);
++
++	(void)b43_radio_read(dev, 0x000b);
++	(void)b43_radio_read(dev, 0x020b);
++
++	b43_radio_write(dev, 0x060c, 0x00be);
++
++	/* Radio defaults, RF-control setup and per-core setup. */
++	b43_radio_2069_init_rev4_class0_prefregs(dev);
++
++	/* Power-up sequence after the radio defaults. */
++	b43_phy_mask(dev, 0x016b, (u16)~0x0400);
++	b43_phy_write(dev, 0x0175, 0x0000);
++
++	b43_radio_2069_mod(dev, 0x08ea, 0x0040, 0x0040);
++	b43_radio_2069_mod(dev, 0x08ea, 0x0080, 0x0080);
++
++	b43_radio_2069_mod(dev, 0x08ed, 0x0600, 0x0000);
++	b43_radio_2069_mod(dev, 0x08ed, 0x1800, 0x0000);
++
++	b43_radio_write(dev, 0x075c, 0x0000);
++	b43_radio_write(dev, 0x075d, 0x0000);
++	b43_radio_write(dev, 0x075e, 0x0000);
++	b43_radio_write(dev, 0x075f, 0x0000);
++	b43_radio_write(dev, 0x0960, 0x0000);
++	b43_radio_write(dev, 0x0961, 0x0000);
++	b43_radio_write(dev, 0x0963, 0x0000);
++
++	/* Reference calibration. */
++	b43_radio_2069_mod(dev, 0x0548, 0x0001, 0x0001);
++
++	b43_radio_write(dev, 0x0549, 0x0000);
++	b43_radio_write(dev, 0x054a, 0x0000);
++	b43_radio_write(dev, 0x054b, 0x0000);
++	b43_radio_write(dev, 0x054c, 0x0000);
++
++	b43_radio_2069_mod(dev, 0x040b, 0x0001, 0x0000);
++	udelay(1);
++	b43_radio_2069_mod(dev, 0x040b, 0x0001, 0x0001);
++
++	for (itr = 0; itr < 100; itr++) {
++		udelay(10);
++		refcal_status = b43_radio_read(dev, 0x040b);
++
++		if (refcal_status & 0x0008)
++			break;
++	}
++
++	/* One more status read after the poll. */
++	refcal_status = b43_radio_read(dev, 0x040b);
++
++	b43_radio_2069_mod(dev, 0x0548, 0x0001, 0x0000);
++
++	b43_radio_2069_mod(dev, 0x08ea, 0x0040, 0x0000);
++	b43_radio_2069_mod(dev, 0x08ea, 0x0080, 0x0000);
++
++	b43_radio_2069_mod(dev, 0x040b, 0x0001, 0x0000);
++
++	/*
++	 * Boards with boardflags3 bit 3 or bit 13 set need an additional
++	 * step here; the board profile only accepts boards with both clear.
++	 */
++
++	/* Analog calibration; -ETIMEDOUT fails the radio power-up. */
++	err = b43_radio_2069_calibrate_analog_rev4_class0(dev);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++/*
++ * Three-phase analog calibration (LPF, per-core LPF code, DAC buffer).
++ * The results are kept in struct b43_phy_ac and used by the RX LPF
++ * setup on each channel change.
++ */
++int b43_radio_2069_calibrate_analog_rev4_class0(struct b43_wldev *dev)
++{
++	static const u8 phase_sel_a[3] = { 1, 0, 0 };
++	static const u8 phase_sel_b[3] = { 0, 2, 1 };
++	static const u8 phase_sel_c[3] = { 0x1c, 0x70, 0x40 };
++	static const u16 phase_word[3] = { 0x014a, 0x0101, 0x011a };
++	const u16 step = 0x00c1;
++	u8 core_count = b43_radio_2069_core_count(dev);
++	u8 phase;
++	u8 core;
++
++	/* Calibration register bank of the BCM4352/BCM4360 class. */
++	if (dev->dev->chip_id != 0x4352 &&
++	    dev->dev->chip_id != 0x4360 &&
++	    dev->dev->chip_id != 0xa9c4 &&
++	    dev->dev->chip_id != 0xaa06)
++		return -EOPNOTSUPP;
++
++	b43_radio_2069_mod(dev, 0x08ea, 0x0080, 0x0080);
++	b43_radio_2069_mod(dev, 0x08ed, 0x0600, 0x0400);
++
++	for (phase = 0; phase < 3; phase++) {
++		bool done = false;
++		unsigned int poll;
++
++		b43_radio_2069_mod(dev, 0x0410, 0x1000,
++				   (phase_sel_a[phase] & 0x0f) << 12);
++		b43_radio_2069_mod(dev, 0x0410, 0x0018,
++				   phase_sel_b[phase] << 3);
++		b43_radio_2069_mod(dev, 0x0411, 0xff00,
++				   phase_sel_c[phase] << 8);
++		b43_radio_write(dev, 0x0412, phase_word[phase]);
++
++		/*
++		 * Phase 2 changes per-core state before the measurement;
++		 * 0x171 is restored after a successful measurement.
++		 */
++		if (phase == 2) {
++			for (core = 0; core < core_count; core++) {
++				u16 bank = (u16)core << 9;
++
++				b43_radio_2069_mod(dev, 0x011d | bank,
++						   0x0004, 0x0000);
++				b43_radio_2069_mod(dev, 0x0171 | bank,
++						   0x2000, 0x2000);
++			}
++		}
++
++		/* Start the measurement and poll for completion. */
++		b43_radio_2069_mod(dev, 0x0410, 0x0001, 0x0000);
++		udelay(1);
++		b43_radio_2069_mod(dev, 0x0410, 0x0001, 0x0001);
++		udelay(35);
++		b43_radio_2069_mod(dev, 0x0411, 0x0001, 0x0001);
++
++		for (poll = 0; poll < 100; poll++) {
++			udelay(100);
++			if (b43_radio_read(dev, 0x0413) & 0x0010) {
++				done = true;
++				break;
++			}
++		}
++
++		b43_radio_2069_mod(dev, 0x0411, 0x0001, 0x0000);
++
++		if (!done) {
++			/*
++			 * Stop the measurement and the calibration enable; the
++			 * phase-2 per-core state is left as it is.
++			 */
++			b43_radio_2069_mod(dev, 0x0410, 0x0001, 0x0000);
++			b43_radio_2069_mod(dev, 0x08ea, 0x0080, 0x0000);
++
++			b43err(dev->wl,
++			       "BCM2069 analog calibration phase %u timeout\n",
++			       phase);
++			return -ETIMEDOUT;
++		}
++
++		if (phase == 0) {
++			u16 cal_lo = b43_radio_read(dev, 0x0414);
++			u16 cal_hi = b43_radio_read(dev, 0x0415);
++			s32 scaled;
++
++			scaled = ((s32)cal_hi - (s32)cal_lo) * step;
++			scaled >>= 8;
++
++			dev->phy.ac->radio2069_cal_lpf_a = (u8)scaled;
++			dev->phy.ac->radio2069_cal_lpf_b = (u8)scaled;
++		} else if (phase == 1) {
++			u16 value = b43_radio_read(dev, 0x0416) & 0x001f;
++
++			for (core = 0; core < core_count; core++) {
++				u16 bank = (u16)core << 9;
++
++				b43_radio_2069_mod(dev, 0x0126 | bank,
++						   0x001f, value);
++				b43_radio_2069_mod(dev, 0x0043 | bank,
++						   0x001f, value);
++			}
++		} else {
++			u16 value = b43_radio_read(dev, 0x0416);
++
++			dev->phy.ac->radio2069_cal_dacbuf =
++				(value & 0x03e0) >> 5;
++
++			for (core = 0; core < core_count; core++) {
++				u16 bank = (u16)core << 9;
++
++				b43_radio_2069_mod(dev, 0x0171 | bank,
++						   0x2000, 0x0000);
++			}
++		}
++
++		/* End this calibration phase. */
++		b43_radio_2069_mod(dev, 0x0410, 0x0001, 0x0000);
++	}
++
++	b43_radio_2069_mod(dev, 0x08ea, 0x0080, 0x0000);
++
++	return 0;
++}
++
++/*
++ * Radio defaults and RF-control setup: load the data set's radio
++ * defaults inside an RF-control reset window, enable the PLL/LOGEN
++ * overrides (the last one, 0x96b bit 2, lets the VCO calibration start
++ * bit take effect; without it the LO does not lock to the programmed
++ * channel), then per-core setup.
++ */
++void b43_radio_2069_init_rev4_class0_prefregs(struct b43_wldev *dev)
++{
++	u16 orig_408;
++	u16 orig_720;
++	u16 orig_728;
++	u16 base_408;
++	u8 core_count;
++	u8 core;
++
++	orig_728 = b43_phy_read(dev, 0x0728);
++	orig_408 = b43_phy_read(dev, 0x0408);
++
++	b43_phy_write(dev, 0x0415, 0x0000);
++	b43_phy_write(dev, 0x040e, 0x0000);
++	b43_phy_write(dev, 0x040c, 0x2000);
++
++	base_408 = orig_408 & 0xfc38;
++	b43_phy_write(dev, 0x0408, base_408);
++
++	b43_phy_write(dev, 0x0417, 0x0000);
++	b43_phy_write(dev, 0x0416, 0x000d);
++
++	b43_phy_write(dev, 0x0728, orig_728 & 0x7e7f);
++
++	orig_720 = b43_phy_read(dev, 0x0720);
++	b43_phy_write(dev, 0x0720, orig_720 | 0x0180);
++
++	b43_phy_write(dev, 0x0408, base_408);
++	b43_phy_write(dev, 0x0408, base_408 | 0x0001);
++	udelay(1);
++	b43_phy_write(dev, 0x0408, base_408);
++
++	b43_radio_2069_load_rev4_prefregs(dev);
++
++	b43_radio_2069_mod(dev, 0x08ea, 0x0100, 0x0100);
++	b43_radio_2069_mod(dev, 0x096b, 0x0800, 0x0800);
++	b43_radio_2069_mod(dev, 0x096b, 0x4000, 0x4000);
++	b43_radio_2069_mod(dev, 0x096c, 0x0800, 0x0800);
++	b43_radio_2069_mod(dev, 0x096b, 0x8000, 0x8000);
++	b43_radio_2069_mod(dev, 0x096b, 0x1000, 0x1000);
++	/* VCO calibration override (OVR15). */
++	b43_radio_2069_mod(dev, 0x096b, 0x0004, 0x0004);
++
++	b43_radio_2069_mod(dev, 0x097f, 0x4000, 0x4000);
++	b43_radio_2069_mod(dev, 0x0980, 0x0800, 0x0800);
++	b43_radio_2069_mod(dev, 0x097f, 0x0800, 0x0800);
++	b43_radio_2069_mod(dev, 0x097f, 0x8000, 0x8000);
++	b43_radio_2069_mod(dev, 0x097f, 0x1000, 0x1000);
++	b43_radio_2069_mod(dev, 0x097f, 0x0004, 0x0004);
++
++	b43_radio_2069_mod(dev, 0x0970, 0x0010, 0x0010);
++	b43_radio_write(dev, 0x0792, 0x0001);
++	b43_radio_2069_mod(dev, 0x0992, 0x0001, 0x0001);
++
++	b43_radio_2069_mod(dev, 0x0970, 0x0001, 0x0001);
++
++	b43_radio_2069_mod(dev, 0x098a, 0x0001, 0x0001);
++	b43_radio_2069_mod(dev, 0x0407, 0x0002, 0x0002);
++	b43_radio_2069_mod(dev, 0x055e, 0x0010, 0x0010);
++
++	/* Core count from PHY[0x00b]; no board override on this device. */
++	core_count = b43_radio_2069_core_count(dev);
++
++	for (core = 0; core < core_count; core++) {
++		u16 bank = (u16)core << 9;
++
++		b43_radio_2069_mod(dev, 0x0126 | bank,
++				   0x0300, 0x0100);
++		b43_radio_2069_mod(dev, 0x0127 | bank,
++				   0x0003, 0x0002);
++		b43_radio_2069_mod(dev, 0x006f | bank,
++				   0x0004, 0x0000);
++		b43_radio_2069_mod(dev, 0x006f | bank,
++				   0x0001, 0x0000);
++		b43_radio_2069_mod(dev, 0x006f | bank,
++				   0x0002, 0x0000);
++		b43_radio_2069_mod(dev, 0x0065 | bank,
++				   0x0001, 0x0000);
++	}
++
++	b43_radio_2069_mod(dev, 0x040c, 0x0010, 0x0000);
++	b43_phy_write(dev, 0x0408, base_408 | 0x0006);
++	udelay(100);
++
++	b43_radio_2069_mod(dev, 0x040c, 0x0010, 0x0010);
++	b43_phy_write(dev, 0x0417, 0x000d);
++	b43_phy_write(dev, 0x0408, base_408 | 0x0002);
++	b43_phy_write(dev, 0x0728, orig_728 | 0x0180);
++	udelay(100);
++
++	b43_phy_write(dev, 0x0417, 0x0004);
++	b43_phy_write(dev, 0x0728, orig_728 & 0xfeff);
++}
++
++/* Write the data set's radio register defaults. */
++void b43_radio_2069_load_rev4_prefregs(struct b43_wldev *dev)
++{
++	const struct b43_bcm4360_data *data = dev->bcm4360_data;
++	unsigned int i;
++
++	for (i = 0; i < data->n_prefregs; i++)
++		b43_radio_write(dev, data->prefregs[i].reg,
++				data->prefregs[i].value);
++}
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/radio_2069.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef B43_RADIO_2069_H_
++#define B43_RADIO_2069_H_
++
++#include <linux/types.h>
++
++struct b43_wldev;
++
++/* Number of AC-PHY radio cores reported by the PHY. */
++u8 b43_radio_2069_core_count(struct b43_wldev *dev);
++void b43_radio_2069_rfpll_setup_rev4_2g20(struct b43_wldev *dev);
++void b43_radio_2069_vcocal_rev4(struct b43_wldev *dev);
++int b43_radio_2069_tune_rev4_2g(struct b43_wldev *dev,
++				unsigned int channel);
++int b43_radio_2069_calibrate_per_core_rev4(struct b43_wldev *dev);
++int b43_radio_2069_power_up_rev4_class0(struct b43_wldev *dev);
++int b43_radio_2069_calibrate_analog_rev4_class0(struct b43_wldev *dev);
++
++void b43_radio_2069_init_rev4_class0_prefregs(struct b43_wldev *dev);
++void b43_radio_2069_load_rev4_prefregs(struct b43_wldev *dev);
++
++#endif /* B43_RADIO_2069_H_ */

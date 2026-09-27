@@ -1,0 +1,821 @@
+From: Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
+Subject: [PATCH] b43: support the BCM4360 2.4 GHz device receive-only
+
+Attach, start and configure the BCM4360 (SPROM 0x43a1, AC-PHY rev 1,
+BCM2069 rev 4) as a receive-only device: program the PMU baseband PLL,
+reset the D11 rev 42 address match table, set up only the RX DMA ring,
+expose NO_IR channels only (passive scanning), station interface only,
+and drop any frame handed to op_tx.  In b43_rx() the AC-PHY type is
+taken from the device and frames that the microcode tagged with a
+channel other than the tuned one are dropped.
+
+A device is only brought up when a board profile matches it (device
+tree compatible, radio slot, NVRAM board data) and its hardware data
+sets pass validation; the only profile is the ASUS RT-AC68U.  Every
+other AC-PHY device and board is rejected before PHY initialisation.
+---
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -887,6 +887,14 @@ struct b43_wldev {
+ 	/* Devicelist in struct b43_wl (all 802.11 cores) */
+ 	struct list_head list;
+ 
++	/*
++	 * BCM4360 receive-only device (bcm4360.h): matched board profile and
++	 * its data sets.  NULL for every other device.
++	 */
++	const struct b43_bcm4360_board *bcm4360_board;
++	const struct b43_bcm4360_data *bcm4360_data;
++	const struct b43_bcm4360_board_data *bcm4360_board_data;
++
+ 	/* Debugging stuff follows. */
+ #ifdef CPTCFG_B43_DEBUG
+ 	struct b43_dfsentry *dfsentry;
+@@ -998,6 +1006,12 @@ static inline int b43_is_mode(struct b43_wl *wl, int type)
+  * b43_current_band - Returns the currently used band.
+  * Returns one of NL80211_BAND_2GHZ and NL80211_BAND_5GHZ.
+  */
++/* True for a BCM4360 device driven in receive-only mode. */
++static inline bool b43_bcm4360_rx_only(struct b43_wldev *dev)
++{
++	return dev && dev->bcm4360_board;
++}
++
+ static inline enum nl80211_band b43_current_band(struct b43_wl *wl)
+ {
+ 	return wl->hw->conf.chandef.chan->band;
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/bcm4360_board.c
+@@ -0,0 +1,220 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Broadcom B43 wireless driver
++ * BCM4360 board profiles
++ *
++ * Copyright (c) 2026 Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
++ *
++ * The BCM4360 receive path depends on the board front end (FEM control
++ * lines, external LNA, T/R switch).  The PCI and SPROM identifiers of the
++ * chip are shared by different board designs, so a device is only accepted
++ * when a profile below matches the machine, the radio slot and the board
++ * data in NVRAM.  Unknown boards are rejected.
++ */
++
++#include <linux/bcm47xx_nvram.h>
++#include <linux/kernel.h>
++#include <linux/of.h>
++
++#include "b43.h"
++#include "bcm4360.h"
++
++/*
++ * ASUS RT-AC68U, 2.4 GHz radio.  The board data package holds the
++ * front-end control table and the receive gain configuration made for
++ * NVRAM rxgains2gelnagaina = 6 and rxgains2gtrisoa = 11.
++ */
++static const struct b43_bcm4360_board b43_bcm4360_boards[] = {
++	{
++		.name = "ASUS RT-AC68U 2.4 GHz",
++		.compatible = "asus,rt-ac68u",
++		.chip_id = 0x4360,
++		.sprom_dev_id = 0x43a1,
++		.phy_rev = 1,
++		.radio_ver = 0x2069,
++		.radio_rev = 4,
++		.cores = 3,
++		.nvram_prefix = "0:",
++		.xtal_khz = 40000,
++		.femctrl = 3,
++		.fem_variant = 3,
++		.boardflags3_clear = BIT(3) | BIT(13),
++		.rxgains_elna = 6,
++		.rxgains_triso = 11,
++		.data_file = "b43/bcm4360-board-asus-rt-ac68u.bin",
++		.data_tag = "rt-ac68u",
++	},
++};
++
++static int b43_bcm4360_nvram_u32(const struct b43_bcm4360_board *board,
++				 const char *key, u32 *value)
++{
++	char name[48];
++	char buf[24];
++	int len;
++
++	snprintf(name, sizeof(name), "%s%s", board->nvram_prefix, key);
++	len = bcm47xx_nvram_getenv(name, buf, sizeof(buf));
++	if (len < 0)
++		return len;
++	return kstrtou32(buf, 0, value);
++}
++
++static bool b43_bcm4360_nvram_is(const struct b43_bcm4360_board *board,
++				 const char *key, u32 expected)
++{
++	u32 value;
++	int err;
++
++	err = b43_bcm4360_nvram_u32(board, key, &value);
++	if (err) {
++		pr_info("b43: %s: NVRAM %s%s unavailable (%d)\n",
++			board->name, board->nvram_prefix, key, err);
++		return false;
++	}
++	if (value != expected) {
++		pr_info("b43: %s: NVRAM %s%s=%u, expected %u\n",
++			board->name, board->nvram_prefix, key, value, expected);
++		return false;
++	}
++	return true;
++}
++
++/* Board data in NVRAM must be the data the profile was made for. */
++static bool b43_bcm4360_board_nvram_ok(const struct b43_bcm4360_board *board)
++{
++	char key[32];
++	unsigned int core;
++
++	if (!b43_bcm4360_nvram_is(board, "devid", board->sprom_dev_id) ||
++	    !b43_bcm4360_nvram_is(board, "xtalfreq", board->xtal_khz) ||
++	    !b43_bcm4360_nvram_is(board, "femctrl", board->femctrl))
++		return false;
++
++	for (core = 0; core < board->cores; core++) {
++		snprintf(key, sizeof(key), "rxgains2gelnagaina%u", core);
++		if (!b43_bcm4360_nvram_is(board, key, board->rxgains_elna))
++			return false;
++		snprintf(key, sizeof(key), "rxgains2gtrisoa%u", core);
++		if (!b43_bcm4360_nvram_is(board, key, board->rxgains_triso))
++			return false;
++	}
++	return true;
++}
++
++static const struct b43_bcm4360_board *
++b43_bcm4360_board_find(u16 chip_id, u16 sprom_dev_id)
++{
++	const struct b43_bcm4360_board *board;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(b43_bcm4360_boards); i++) {
++		board = &b43_bcm4360_boards[i];
++		if (board->chip_id == chip_id &&
++		    board->sprom_dev_id == sprom_dev_id &&
++		    of_machine_is_compatible(board->compatible) &&
++		    b43_bcm4360_board_nvram_ok(board))
++			return board;
++	}
++	return NULL;
++}
++
++/*
++ * Before the D11 core is attached (PMU setup): true only for a matching
++ * board whose data sets are available and valid, so that nothing is
++ * programmed on a device that will be rejected at attach.
++ */
++bool b43_bcm4360_bcma_ready(struct bcma_device *core)
++{
++	struct bcma_bus *bus = core->bus;
++	const struct b43_bcm4360_board *board;
++	const struct b43_bcm4360_data *data;
++	const struct b43_bcm4360_board_data *board_data;
++
++	board = b43_bcm4360_board_find(bus->chipinfo.id, bus->sprom.dev_id);
++	return board &&
++	       !b43_bcm4360_data_get(board, &core->dev, &data, &board_data) &&
++	       !b43_bcm4360_data_check(board, data, board_data);
++}
++
++/*
++ * Full match once the PHY and radio versions are known.  The core count is
++ * checked against board->cores when the PHY is initialized.
++ */
++const struct b43_bcm4360_board *b43_bcm4360_board_match(struct b43_wldev *dev)
++{
++	const struct ssb_sprom *sprom = dev->dev->bus_sprom;
++	const struct b43_bcm4360_board *board;
++
++	if (!sprom || dev->phy.type != B43_PHYTYPE_AC)
++		return NULL;
++
++	board = b43_bcm4360_board_find(dev->dev->chip_id, sprom->dev_id);
++	if (!board)
++		return NULL;
++
++	if (dev->phy.rev != board->phy_rev ||
++	    dev->phy.radio_ver != board->radio_ver ||
++	    dev->phy.radio_rev != board->radio_rev ||
++	    (sprom->boardflags3 & 0x7) != board->fem_variant ||
++	    (sprom->boardflags3 & board->boardflags3_clear) ||
++	    (sprom->boardflags_lo & B43_BFL_BTCOEXIST))
++		return NULL;
++
++	return board;
++}
++
++/*
++ * Mandatory sections for passive reception: the OFDM phase-tracking table
++ * (PHY table 0x05), RF-sequencer entries, radio defaults, 14 channel rows,
++ * 14 Farrow rows, the receive gain tables, one front-end control table per
++ * receive core and the board receive gain configuration.  Other
++ * initialisation and per-channel tables and the RX EVM entries are
++ * optional.
++ */
++static bool b43_bcm4360_has_init_table(const struct b43_bcm4360_data *data,
++				       u16 id, u16 width, u16 count)
++{
++	unsigned int i;
++
++	for (i = 0; i < data->n_init_tables; i++)
++		if (data->init_tables[i].id == id &&
++		    data->init_tables[i].width == width &&
++		    data->init_tables[i].count == count &&
++		    data->init_tables[i].data)
++			return true;
++	return false;
++}
++
++int b43_bcm4360_data_check(const struct b43_bcm4360_board *board,
++			   const struct b43_bcm4360_data *data,
++			   const struct b43_bcm4360_board_data *board_data)
++{
++	unsigned int i;
++
++	if (!data || !board_data ||
++	    !data->rfseq7 || !data->n_rfseq7 ||
++	    !data->prefregs || !data->n_prefregs ||
++	    !data->chan_2g || data->n_chan_2g != 14 ||
++	    !data->farrow_2g || data->n_farrow_2g != 14 ||
++	    (data->n_init_tables && !data->init_tables) ||
++	    (data->n_chan_tables && !data->chan_tables) ||
++	    !data->rx_gain_tables ||
++	    !board_data->fem_lut || board_data->n_fem_cores != board->cores ||
++	    !board_data->rx_gain)
++		return -EINVAL;
++
++	if (!b43_bcm4360_has_init_table(data, 0x05, 32, 22))
++		return -EINVAL;
++
++	for (i = 0; i < data->n_chan_2g; i++)
++		if (data->chan_2g[i][0] != i + 1)
++			return -EINVAL;
++
++	for (i = 0; i < data->n_rfseq7; i++)
++		if (data->rfseq7[i].id != 7 || data->rfseq7[i].width != 16 ||
++		    !data->rfseq7[i].data)
++			return -EINVAL;
++
++	return 0;
++}
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -30,12 +30,16 @@
+ #include <linux/io.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/slab.h>
++#include <linux/pci.h>
+ #include <linux/unaligned.h>
+ 
+ #include "b43.h"
+ #include "main.h"
+ #include "debugfs.h"
+ #include "phy_common.h"
++#include "phy_ac.h"
++#include "bcm4360.h"
++#include "radio_2069.h"
+ #include "phy_g.h"
+ #include "phy_n.h"
+ #include "dma.h"
+@@ -215,6 +219,27 @@ static struct ieee80211_channel b43_2ghz_chantable[] = {
+ 
+ /* No support for the last 3 channels (12, 13, 14) */
+ #define b43_2ghz_chantable_limited_size		11
++
++/*
++ * The receive-only BCM4360 never initiates radiation: every channel is
++ * NO_IR, so cfg80211/mac80211 only scan passively and never beacon.
++ */
++static struct ieee80211_channel b43_2ghz_chantable_rx_only[] = {
++	CHAN2G(1, 2412, IEEE80211_CHAN_NO_IR),
++	CHAN2G(2, 2417, IEEE80211_CHAN_NO_IR),
++	CHAN2G(3, 2422, IEEE80211_CHAN_NO_IR),
++	CHAN2G(4, 2427, IEEE80211_CHAN_NO_IR),
++	CHAN2G(5, 2432, IEEE80211_CHAN_NO_IR),
++	CHAN2G(6, 2437, IEEE80211_CHAN_NO_IR),
++	CHAN2G(7, 2442, IEEE80211_CHAN_NO_IR),
++	CHAN2G(8, 2447, IEEE80211_CHAN_NO_IR),
++	CHAN2G(9, 2452, IEEE80211_CHAN_NO_IR),
++	CHAN2G(10, 2457, IEEE80211_CHAN_NO_IR),
++	CHAN2G(11, 2462, IEEE80211_CHAN_NO_IR),
++	CHAN2G(12, 2467, IEEE80211_CHAN_NO_IR),
++	CHAN2G(13, 2472, IEEE80211_CHAN_NO_IR),
++	CHAN2G(14, 2484, IEEE80211_CHAN_NO_IR),
++};
+ #undef CHAN2G
+ 
+ #define CHAN4G(_channel, _flags) {				\
+@@ -356,6 +381,14 @@ static struct ieee80211_supported_band b43_band_2GHz = {
+ 	.n_bitrates	= b43_g_ratetable_size,
+ };
+ 
++static struct ieee80211_supported_band b43_band_2ghz_rx_only = {
++	.band		= NL80211_BAND_2GHZ,
++	.channels	= b43_2ghz_chantable_rx_only,
++	.n_channels	= ARRAY_SIZE(b43_2ghz_chantable_rx_only),
++	.bitrates	= b43_g_ratetable,
++	.n_bitrates	= b43_g_ratetable_size,
++};
++
+ static struct ieee80211_supported_band b43_band_2ghz_limited = {
+ 	.band		= NL80211_BAND_2GHZ,
+ 	.channels	= b43_2ghz_chantable,
+@@ -3248,6 +3281,41 @@ static void b43_chip_exit(struct b43_wldev *dev)
+ 	/* firmware is released later */
+ }
+ 
++/*
++ * BCM4360 (D11 rev 42) address match table (AMT) reset.
++ *
++ * D11 rev 40 and later use an AMT instead of the older RCM address-match
++ * registers.  All 64 entries are cleared after microcode/GPIO
++ * initialization and before the initvals are written.  Restricted to the
++ * BCM4360 rev 42.
++ */
++static void b43_bcm4360_reset_amt_rev42(struct b43_wldev *dev)
++{
++	const u32 objaddr_amt_sel = 0x00040000;
++	const u32 objaddr_auto_inc = 0x03000000;
++	unsigned int i;
++
++	if (dev->dev->chip_id != 0x4360 ||
++	    dev->dev->core_rev != 42)
++		return;
++
++	for (i = 0; i < 64; i++) {
++		b43_write32(dev, B43_MMIO_SHM_CONTROL,
++			    objaddr_auto_inc |
++			    objaddr_amt_sel |
++			    (i * 2));
++
++		/*
++		 * Read back the object address before streaming the two
++		 * zero words of this entry.
++		 */
++		(void)b43_read32(dev, B43_MMIO_SHM_CONTROL);
++
++		b43_write32(dev, B43_MMIO_SHM_DATA, 0);
++		b43_write32(dev, B43_MMIO_SHM_DATA, 0);
++	}
++}
++
+ /* Initialize the chip
+  * https://bcm-specs.sipsolutions.net/ChipInit
+  */
+@@ -3273,6 +3341,9 @@ static int b43_chip_init(struct b43_wldev *dev)
+ 	if (err)
+ 		goto out;	/* firmware is released later */
+ 
++	/* D11 rev 42: reset the AMT after microcode/GPIO, before initvals. */
++	b43_bcm4360_reset_amt_rev42(dev);
++
+ 	err = b43_upload_initvals(dev);
+ 	if (err)
+ 		goto err_gpio_clean;
+@@ -3325,12 +3396,21 @@ static int b43_chip_init(struct b43_wldev *dev)
+ 		b43_write32(dev, 0x018C, 0x02000000);
+ 	}
+ 	b43_write32(dev, B43_MMIO_GEN_IRQ_REASON, 0x00004000);
+-	b43_write32(dev, B43_MMIO_DMA0_IRQ_MASK, 0x0001FC00);
+-	b43_write32(dev, B43_MMIO_DMA1_IRQ_MASK, 0x0000DC00);
+-	b43_write32(dev, B43_MMIO_DMA2_IRQ_MASK, 0x0000DC00);
+-	b43_write32(dev, B43_MMIO_DMA3_IRQ_MASK, 0x0001DC00);
+-	b43_write32(dev, B43_MMIO_DMA4_IRQ_MASK, 0x0000DC00);
+-	b43_write32(dev, B43_MMIO_DMA5_IRQ_MASK, 0x0000DC00);
++
++	if (b43_bcm4360_rx_only(dev)) {
++		/*
++		 * Receive-only device: DMA engine 0 is the b43 RX engine;
++		 * no TX DMA interrupt engine is armed.
++		 */
++		b43_write32(dev, B43_MMIO_DMA0_IRQ_MASK, 0x0001FC00);
++	} else {
++		b43_write32(dev, B43_MMIO_DMA0_IRQ_MASK, 0x0001FC00);
++		b43_write32(dev, B43_MMIO_DMA1_IRQ_MASK, 0x0000DC00);
++		b43_write32(dev, B43_MMIO_DMA2_IRQ_MASK, 0x0000DC00);
++		b43_write32(dev, B43_MMIO_DMA3_IRQ_MASK, 0x0001DC00);
++		b43_write32(dev, B43_MMIO_DMA4_IRQ_MASK, 0x0000DC00);
++		b43_write32(dev, B43_MMIO_DMA5_IRQ_MASK, 0x0000DC00);
++	}
+ 
+ 	b43_mac_phy_clock_set(dev, true);
+ 
+@@ -3645,6 +3725,12 @@ static void b43_op_tx(struct ieee80211_hw *hw,
+ 	struct b43_wl *wl = hw_to_b43_wl(hw);
+ 	u16 skb_queue_mapping;
+ 
++	/* The receive-only BCM4360 has no TX rings: never transmit. */
++	if (unlikely(b43_bcm4360_rx_only(wl->current_dev))) {
++		ieee80211_free_txskb(hw, skb);
++		return;
++	}
++
+ 	if (unlikely(skb->len < 2 + 2 + 6)) {
+ 		/* Too short, this can't be a valid frame. */
+ 		ieee80211_free_txskb(hw, skb);
+@@ -4001,6 +4087,31 @@ static int b43_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
+ 	mutex_lock(&wl->mutex);
+ 	b43_mac_suspend(dev);
+ 
++	if (b43_bcm4360_rx_only(dev)) {
++		/*
++		 * Receive-only device: only channel changes are applied;
++		 * no TX power or management TX configuration.
++		 */
++		if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
++			if (!conf->chandef.chan ||
++			    conf->chandef.chan->band != NL80211_BAND_2GHZ) {
++				err = -EINVAL;
++				goto rx_only_out;
++			}
++
++			phy->chandef = &conf->chandef;
++			phy->channel = conf->chandef.chan->hw_value;
++
++			err = b43_switch_channel(dev, phy->channel);
++		}
++
++rx_only_out:
++		b43_mac_enable(dev);
++
++		mutex_unlock(&wl->mutex);
++		return err;
++	}
++
+ 	if (changed & IEEE80211_CONF_CHANGE_LISTEN_INTERVAL)
+ 		b43_set_beacon_listen_interval(dev, conf->listen_interval);
+ 
+@@ -4125,6 +4236,21 @@ static void b43_op_bss_info_changed(struct ieee80211_hw *hw,
+ 
+ 	B43_WARN_ON(wl->vif != vif);
+ 
++	if (b43_bcm4360_rx_only(dev)) {
++		/*
++		 * Receive-only device: retain the software BSSID image,
++		 * but do not touch beacon/basic-rate/TX timing state.
++		 */
++		if (changed & BSS_CHANGED_BSSID) {
++			if (conf->bssid)
++				memcpy(wl->bssid, conf->bssid, ETH_ALEN);
++			else
++				eth_zero_addr(wl->bssid);
++		}
++
++		goto out_unlock_mutex;
++	}
++
+ 	if (changed & BSS_CHANGED_BSSID) {
+ 		if (conf->bssid)
+ 			memcpy(wl->bssid, conf->bssid, ETH_ALEN);
+@@ -4349,7 +4475,13 @@ redo:
+ 
+ 	/* Cancel work. Unlock to avoid deadlocks. */
+ 	mutex_unlock(&wl->mutex);
+-	cancel_delayed_work_sync(&dev->periodic_work);
++	/*
++	 * The receive-only BCM4360 start returns before
++	 * b43_periodic_tasks_setup(), so periodic_work was never
++	 * initialized: do not cancel it.
++	 */
++	if (!b43_bcm4360_rx_only(dev))
++		cancel_delayed_work_sync(&dev->periodic_work);
+ 	cancel_work_sync(&wl->tx_work);
+ 	b43_leds_stop(dev);
+ 	mutex_lock(&wl->mutex);
+@@ -4432,6 +4564,25 @@ static int b43_wireless_core_start(struct b43_wldev *dev)
+ 		}
+ 	}
+ 
++	if (b43_bcm4360_rx_only(dev)) {
++		/*
++		 * Receive-only start: no TX queue wake, no periodic TX-power
++		 * work and no LED side paths.  Only DMA receive IRQs are
++		 * enabled.
++		 */
++		dev->irq_mask = B43_IRQ_DMA;
++
++		b43_set_status(dev, B43_STAT_STARTED);
++
++		b43_write32(dev, B43_MMIO_DMA0_IRQ_MASK, 0x0001FC00);
++
++		b43_mac_enable(dev);
++
++		b43_write32(dev, B43_MMIO_GEN_IRQ_MASK, dev->irq_mask);
++
++		goto out;
++	}
++
+ 	/* We are ready to run. */
+ 	ieee80211_wake_queues(dev->wl->hw);
+ 	b43_set_status(dev, B43_STAT_STARTED);
+@@ -4930,6 +5081,54 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
+ 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_PHYTYPE, phy->type);
+ 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_PHYVER, phy->rev);
+ 
++	if (b43_bcm4360_rx_only(dev)) {
++		/*
++		 * Receive-only device: set up the RX ring only, no TX
++		 * rings.
++		 */
++		dev->__using_pio_transfers = false;
++
++		err = b43_dma_init_rx_only(dev);
++		if (err) {
++			b43err(dev->wl,
++			       "BCM4360: RX DMA init failed: %d\n",
++			       err);
++			goto err_chip_exit;
++		}
++
++		if (!dev->dma.rx_ring ||
++		    dev->dma.tx_ring_AC_BK ||
++		    dev->dma.tx_ring_AC_BE ||
++		    dev->dma.tx_ring_AC_VI ||
++		    dev->dma.tx_ring_AC_VO ||
++		    dev->dma.tx_ring_mcast) {
++			b43err(dev->wl,
++			       "BCM4360: unexpected TX DMA ring\n");
++			err = -EIO;
++			goto err_chip_exit;
++		}
++
++		/* Keep firmware-generated probe responses disabled. */
++		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_PRMAXTIME, 1);
++
++		b43_set_synth_pu_delay(dev, 1);
++
++		b43_bus_powerup(dev,
++				!(sprom->boardflags_lo & B43_BFL_XTAL_NOSLOW));
++
++		b43_upload_card_macaddress(dev);
++
++		/*
++		 * Only the top-level DMA interrupt is needed.
++		 * TX_OK and PHY/MAC TX errors stay masked.
++		 */
++		dev->irq_mask = B43_IRQ_DMA;
++
++		b43_set_status(dev, B43_STAT_INITIALIZED);
++
++		goto out;
++	}
++
+ 	if (b43_bus_host_is_pcmcia(dev->dev) ||
+ 	    b43_bus_host_is_sdio(dev->dev)) {
+ 		dev->__using_pio_transfers = true;
+@@ -4996,6 +5195,19 @@ static int b43_op_add_interface(struct ieee80211_hw *hw,
+ 	wl->if_type = vif->type;
+ 	memcpy(wl->mac_addr, vif->addr, ETH_ALEN);
+ 
++	if (b43_bcm4360_rx_only(dev)) {
++		/*
++		 * Receive foreign BSS beacons/probe responses.
++		 * Do not configure any management-frame TX path.
++		 */
++		b43_upload_card_macaddress(dev);
++
++		b43_maskset32(dev, B43_MMIO_MACCTL, ~0, B43_MACCTL_BEACPROMISC);
++
++		err = 0;
++		goto out_mutex_unlock;
++	}
++
+ 	b43_adjust_opmode(dev);
+ 	b43_set_pretbtt(dev);
+ 	b43_set_synth_pu_delay(dev, 0);
+@@ -5005,7 +5217,7 @@ static int b43_op_add_interface(struct ieee80211_hw *hw,
+  out_mutex_unlock:
+ 	mutex_unlock(&wl->mutex);
+ 
+-	if (err == 0)
++	if (err == 0 && !b43_bcm4360_rx_only(dev))
+ 		b43_op_bss_info_changed(hw, vif, &vif->bss_conf, ~0);
+ 
+ 	return err;
+@@ -5041,6 +5253,13 @@ static int b43_op_start(struct ieee80211_hw *hw)
+ 	int did_init = 0;
+ 	int err = 0;
+ 
++	/* AC-PHY: only the receive-only BCM4360 2.4 GHz device can start. */
++	if (dev && dev->phy.type == B43_PHYTYPE_AC &&
++	    !b43_bcm4360_rx_only(dev)) {
++		b43err(wl, "AC-PHY device not supported\n");
++		return -EOPNOTSUPP;
++	}
++
+ 	/* Kill all old instance specific information to make sure
+ 	 * the card won't use it in the short timeframe between start
+ 	 * and mac80211 reconfiguring it. */
+@@ -5329,6 +5548,12 @@ static int b43_setup_bands(struct b43_wldev *dev,
+ 	if (have_2ghz_phy)
+ 		hw->wiphy->bands[NL80211_BAND_2GHZ] = limited_2g ?
+ 			&b43_band_2ghz_limited : &b43_band_2GHz;
++	if (have_2ghz_phy && b43_bcm4360_rx_only(dev)) {
++		hw->wiphy->bands[NL80211_BAND_2GHZ] = &b43_band_2ghz_rx_only;
++		/* Keep NO_IR even when beacons are heard on a channel. */
++		hw->wiphy->regulatory_flags |= REGULATORY_DISABLE_BEACON_HINTS;
++		hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
++	}
+ 	if (dev->phy.type == B43_PHYTYPE_N) {
+ 		if (have_5ghz_phy)
+ 			hw->wiphy->bands[NL80211_BAND_5GHZ] = limited_5g ?
+@@ -5391,6 +5616,11 @@ static void b43_supported_bands(struct b43_wldev *dev, bool *have_2ghz_phy,
+ 		*have_2ghz_phy = true;
+ 		*have_5ghz_phy = true;
+ 		return;
++	case 0x43a1: /* BCM4360 2.4 GHz */
++		/* 2.4 GHz only device */
++		*have_2ghz_phy = true;
++		*have_5ghz_phy = false;
++		return;
+ 	case 0x4321: /* BCM4306 */
+ 		/* There are 14e4:4321 PCI devs with 2.4 GHz BCM4321 (N-PHY) */
+ 		if (dev->phy.type != B43_PHYTYPE_G)
+@@ -5478,6 +5708,50 @@ static int b43_wireless_core_attach(struct b43_wldev *dev)
+ 	if (err)
+ 		goto err_powerdown;
+ 
++#ifdef CPTCFG_B43_PHY_AC
++	/*
++	 * AC-PHY: only the BCM4360 2.4 GHz device is supported, receive-only.
++	 * Anything else is rejected before any PHY or radio access.
++	 */
++	if (phy->type == B43_PHYTYPE_AC) {
++		dev->bcm4360_board = b43_bcm4360_board_match(dev);
++		if (!dev->bcm4360_board) {
++			err = -EOPNOTSUPP;
++			goto err_powerdown;
++		}
++		err = b43_bcm4360_data_get(dev->bcm4360_board, dev->dev->dev,
++					   &dev->bcm4360_data,
++					   &dev->bcm4360_board_data);
++		if (!err)
++			err = b43_bcm4360_data_check(dev->bcm4360_board,
++						     dev->bcm4360_data,
++						     dev->bcm4360_board_data);
++		if (err) {
++			b43err(wl, "%s: BCM4360 data sets unavailable (%d)\n",
++			       dev->bcm4360_board->name, err);
++			dev->bcm4360_board = NULL;
++			goto err_powerdown;
++		}
++
++		err = b43_phy_allocate(dev);
++		if (err)
++			goto err_powerdown;
++
++		dev->phy.gmode = true;
++		err = b43_setup_bands(dev, true, false);
++		if (err)
++			goto err_phy_free;
++
++		if (!wl->current_dev)
++			wl->current_dev = dev;
++		INIT_WORK(&dev->restart_work, b43_chip_reset);
++
++		b43_device_disable(dev, 0);
++		b43_bus_may_powerdown(dev);
++		return 0;
++	}
++#endif
++
+ 	/* Get real info about supported bands */
+ 	b43_supported_bands(dev, &have_2ghz_phy, &have_5ghz_phy);
+ 
+@@ -5682,6 +5956,45 @@ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
+ }
+ 
+ #ifdef CPTCFG_B43_BCMA
++/*
++ * BCM4360 baseband PLL frequency.
++ *
++ * The BCM4360 (chip revision > 2) baseband VCO must run at 960.0098 MHz
++ * (40 MHz crystal):
++ *   PLLCTL2 = (24 << 7) | (3 << 4) | 1          = 0x0c31
++ *   PLLCTL3 = 98 * 2^24 / (40 * 10000)          = 0x100e
++ * followed by a PMU PLL update.
++ *
++ * Upstream bcma has no BCM4360 case, so the ROM value PLLCTL3 = 0x00133333
++ * stays active: a 963.00 MHz instead of 960.0098 MHz baseband VCO (+0.31 %),
++ * which shows up as a matching DSSS symbol-clock drift and bad FCS on every
++ * received frame.  The proper owner is bcma_pmu_pll_init(); it is done here
++ * because bcma is built into the target kernel.  Runs before any D11 core
++ * reset and is skipped when the PLL is already programmed.
++ */
++static void b43_bcma_bcm4360_bbpll_init(struct bcma_device *core)
++{
++	struct bcma_bus *bus = core->bus;
++	struct bcma_drv_cc *cc = &bus->drv_cc;
++	u32 pll2, pll3;
++
++	if (bus->chipinfo.id != BCMA_CHIP_ID_BCM4360 ||
++	    !b43_bcm4360_bcma_ready(core) ||
++	    bus->chipinfo.rev <= 2 ||
++	    !(cc->capabilities & BCMA_CC_CAP_PMU))
++		return;
++
++	pll2 = bcma_chipco_pll_read(cc, BCMA_CC_PMU_PLL_CTL2);
++	pll3 = bcma_chipco_pll_read(cc, BCMA_CC_PMU_PLL_CTL3);
++	if (pll2 == 0x0c31 && pll3 == 0x100e)
++		return;
++
++	bcma_chipco_pll_write(cc, BCMA_CC_PMU_PLL_CTL2, 0x0c31);
++	bcma_chipco_pll_write(cc, BCMA_CC_PMU_PLL_CTL3, 0x100e);
++	bcma_pmu_set32(cc, BCMA_CC_PMU_CTL, BCMA_CC_PMU_CTL_PLL_UPD);
++	udelay(100);
++}
++
+ static int b43_bcma_probe(struct bcma_device *core)
+ {
+ 	struct b43_bus_dev *dev;
+@@ -5694,6 +6007,8 @@ static int b43_bcma_probe(struct bcma_device *core)
+ 		return -ENOTSUPP;
+ 	}
+ 
++	b43_bcma_bcm4360_bbpll_init(core);
++
+ 	dev = b43_bus_dev_bcma_init(core);
+ 	if (!dev)
+ 		return -ENODEV;
+@@ -5915,6 +6230,7 @@ static void __exit b43_exit(void)
+ #ifdef CPTCFG_B43_BCMA
+ 	bcma_driver_unregister(&b43_bcma_driver);
+ #endif
++	b43_bcm4360_data_release();
+ 	b43_sdio_exit();
+ 	b43_debugfs_exit();
+ }
+--- a/drivers/net/wireless/broadcom/b43/xmit.c
++++ b/drivers/net/wireless/broadcom/b43/xmit.c
+@@ -640,6 +640,7 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
+ 	u16 chanstat, mactime;
+ 	u32 macstat;
+ 	u16 chanid;
++	u16 rx_phytype;
+ 	int padding, rate_idx;
+ 
+ 	memset(&status, 0, sizeof(status));
+@@ -661,6 +662,15 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
+ 		break;
+ 	}
+ 
++	/*
++	 * The RX channel status word carries only three PHY-type bits, so
++	 * an AC-PHY (type 0x0b) cannot be encoded there.  Use the device
++	 * PHY type for AC-PHY devices.
++	 */
++	rx_phytype = chanstat & B43_RX_CHAN_PHYTYPE;
++	if (dev->phy.type == B43_PHYTYPE_AC)
++		rx_phytype = B43_PHYTYPE_AC;
++
+ 	if (unlikely(macstat & B43_RX_MAC_FCSERR)) {
+ 		dev->wl->ieee_stats.dot11FCSErrorCount++;
+ 		status.flag |= RX_FLAG_FAILED_FCS_CRC;
+@@ -717,7 +727,8 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
+ 	}
+ 
+ 	/* Link quality statistics */
+-	switch (chanstat & B43_RX_CHAN_PHYTYPE) {
++	switch (rx_phytype) {
++	case B43_PHYTYPE_AC:
+ 	case B43_PHYTYPE_HT:
+ 		/* TODO: is max the right choice? */
+ 		status.signal = max_t(__s8,
+@@ -776,7 +787,7 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
+ 	}
+ 
+ 	chanid = (chanstat & B43_RX_CHAN_ID) >> B43_RX_CHAN_ID_SHIFT;
+-	switch (chanstat & B43_RX_CHAN_PHYTYPE) {
++	switch (rx_phytype) {
+ 	case B43_PHYTYPE_G:
+ 		status.band = NL80211_BAND_2GHZ;
+ 		/* Somewhere between 478.104 and 508.1084 firmware for G-PHY
+@@ -799,6 +810,19 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
+ 		status.freq =
+ 			ieee80211_channel_to_frequency(chanid, status.band);
+ 		break;
++	case B43_PHYTYPE_AC:
++		/*
++		 * The microcode tags each frame with the channel cookie last
++		 * written to B43_SHM_SH_CHAN (the plain channel number).  Frames
++		 * still queued from before a channel switch carry the previous
++		 * channel; drop them rather than report them on the new one.
++		 */
++		if (!dev->phy.chandef || !dev->phy.chandef->chan ||
++		    (chanstat & 0xff) != dev->phy.chandef->chan->hw_value)
++			goto drop;
++		status.band = dev->phy.chandef->chan->band;
++		status.freq = dev->phy.chandef->chan->center_freq;
++		break;
+ 	default:
+ 		B43_WARN_ON(1);
+ 		goto drop;

@@ -1,0 +1,647 @@
+From: Massimo Mazzariol <massimomazzariol@users.noreply.github.com>
+Subject: [PATCH] b43: dma: BCM4360 receive ring
+
+D11 rev 42 RX DMA for the BCM4360: a 2048-descriptor DMA64 ring with 256
+posted buffers and independent reclaim/post cursors, DMA64 pointer
+layout and descriptor alignment probe, RX engine armed after the ring
+is programmed, frame offset 40 and burst/prefetch settings.  Adds an
+RX-only ring setup helper; other devices are unchanged.
+---
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -231,17 +231,44 @@ static void op64_tx_resume(struct b43_dmaring *ring)
+ static int op64_get_current_rxslot(struct b43_dmaring *ring)
+ {
+ 	u32 val;
++	u32 mask;
+ 
+ 	val = b43_dma_read(ring, B43_DMA64_RXSTATUS);
+-	val &= B43_DMA64_RXSTATDPTR;
+ 
+-	return (val / sizeof(struct b43_dmadesc64));
++	if (unlikely(ring->bcm4360_split_rx &&
++		     ring->bcm4360_rx_ptr_mask)) {
++		/*
++		 * DMA64 consumer index relative to the ring base:
++		 *
++		 *   (((status & mask) - ptr_base) & mask) / 16
++		 */
++		mask = ring->bcm4360_rx_ptr_mask;
++		val &= mask;
++		val = (val - ring->bcm4360_rx_ptr_base) & mask;
++	} else {
++		val &= B43_DMA64_RXSTATDPTR;
++	}
++
++	return val / sizeof(struct b43_dmadesc64);
+ }
+ 
+ static void op64_set_current_rxslot(struct b43_dmaring *ring, int slot)
+ {
+-	b43_dma_write(ring, B43_DMA64_RXINDEX,
+-		      (u32) (slot * sizeof(struct b43_dmadesc64)));
++	u32 ptr;
++
++	ptr = (u32)slot * sizeof(struct b43_dmadesc64);
++
++	if (unlikely(ring->bcm4360_split_rx &&
++		     ring->bcm4360_rx_ptr_mask)) {
++		/*
++		 * DMA64 producer pointer: ptr_base + slot * 16, limited to
++		 * the bits implemented by the hardware pointer field.
++		 */
++		ptr = (ring->bcm4360_rx_ptr_base + ptr) &
++		      ring->bcm4360_rx_ptr_mask;
++	}
++
++	b43_dma_write(ring, B43_DMA64_RXINDEX, ptr);
+ }
+ 
+ static const struct b43_dma_ops dma64_ops = {
+@@ -404,6 +431,23 @@ static inline
+ 	}
+ }
+ 
++/*
++ * The BCM4360 RX ring uses 2048 DMA64 descriptors, more than the fixed
++ * B43_DMA64_RINGMEMSIZE; other devices keep the generic allocation:
++ *
++ *     2048 descriptors * 16 bytes = 32768 bytes.
++ */
++static size_t b43_ringmemory_size(struct b43_dmaring *ring)
++{
++	if (!ring->tx &&
++	    ring->type == B43_DMA_64BIT &&
++	    ring->bcm4360_split_rx)
++		return ring->nr_slots * sizeof(struct b43_dmadesc64);
++
++	return (ring->type == B43_DMA_64BIT) ?
++		B43_DMA64_RINGMEMSIZE : B43_DMA32_RINGMEMSIZE;
++}
++
+ static int alloc_ringmemory(struct b43_dmaring *ring)
+ {
+ 	/* The specs call for 4K buffers for 30- and 32-bit DMA with 4K
+@@ -415,8 +459,7 @@ static int alloc_ringmemory(struct b43_dmaring *ring)
+ 	 * B43_DMA64_RXSTATDPTR. Let's just use 8K buffers even if we don't use
+ 	 * more than 256 slots for ring.
+ 	 */
+-	u16 ring_mem_size = (ring->type == B43_DMA_64BIT) ?
+-				B43_DMA64_RINGMEMSIZE : B43_DMA32_RINGMEMSIZE;
++	size_t ring_mem_size = b43_ringmemory_size(ring);
+ 
+ 	ring->descbase = dma_alloc_coherent(ring->dev->dev->dma_dev,
+ 					    ring_mem_size, &(ring->dmabase),
+@@ -424,13 +467,30 @@ static int alloc_ringmemory(struct b43_dmaring *ring)
+ 	if (!ring->descbase)
+ 		return -ENOMEM;
+ 
++	if (!ring->tx && ring->bcm4360_split_rx)
++		b43dbg(ring->dev->wl,
++		       "BCM4360 RX ring: capacity=%d posted=%d desc_bytes=%zu ring_bytes=%zu dmabase=0x%llx\n",
++			ring->nr_slots,
++			ring->rx_posted_slots,
++			sizeof(struct b43_dmadesc64),
++			ring_mem_size,
++			(unsigned long long)ring->dmabase);
++
++	/*
++	 * When fewer RX buffers are posted than the ring holds, clear the
++	 * whole descriptor table before the initial descriptors are
++	 * published.
++	 */
++	if (!ring->tx && ring->rx_posted_slots < ring->nr_slots)
++		memset(ring->descbase, 0, ring_mem_size);
++
+ 	return 0;
+ }
+ 
+ static void free_ringmemory(struct b43_dmaring *ring)
+ {
+-	u16 ring_mem_size = (ring->type == B43_DMA_64BIT) ?
+-				B43_DMA64_RINGMEMSIZE : B43_DMA32_RINGMEMSIZE;
++	size_t ring_mem_size = b43_ringmemory_size(ring);
++
+ 	dma_free_coherent(ring->dev->dev->dma_dev, ring_mem_size,
+ 			  ring->descbase, ring->dmabase);
+ }
+@@ -639,7 +699,7 @@ static int alloc_initial_descbuffers(struct b43_dmaring *ring)
+ 	struct b43_dmadesc_generic *desc;
+ 	struct b43_dmadesc_meta *meta;
+ 
+-	for (i = 0; i < ring->nr_slots; i++) {
++	for (i = 0; i < ring->rx_posted_slots; i++) {
+ 		desc = ring->ops->idx2desc(ring, i, &meta);
+ 
+ 		err = setup_rx_descbuffer(ring, desc, meta, GFP_KERNEL);
+@@ -650,7 +710,7 @@ static int alloc_initial_descbuffers(struct b43_dmaring *ring)
+ 		}
+ 	}
+ 	mb();
+-	ring->used_slots = ring->nr_slots;
++	ring->used_slots = ring->rx_posted_slots;
+ 	err = 0;
+       out:
+ 	return err;
+@@ -712,21 +772,131 @@ static int dmacontroller_setup(struct b43_dmaring *ring)
+ 			goto out;
+ 		if (ring->type == B43_DMA_64BIT) {
+ 			u64 ringbase = (u64) (ring->dmabase);
++			bool bcm4360_rx_late_arm;
++
+ 			addrext = b43_dma_address(&ring->dev->dma, ringbase, B43_DMA_ADDR_EXT);
+ 			addrlo = b43_dma_address(&ring->dev->dma, ringbase, B43_DMA_ADDR_LOW);
+ 			addrhi = b43_dma_address(&ring->dev->dma, ringbase, B43_DMA_ADDR_HIGH);
+ 
++			/*
++			 * BCM4360 receive-only device, RX controller 0: keep the
++			 * engine disabled until the descriptor table base and the
++			 * producer pointer are programmed.  Enabling it first
++			 * gives a descriptor protocol error at descriptor 0.
++			 * TX setup and every other b43 device keep the existing
++			 * order.
++			 */
++			bcm4360_rx_late_arm =
++				ring->index == 0 &&
++				b43_bcm4360_rx_only(ring->dev);
++
+ 			value = (ring->frameoffset << B43_DMA64_RXFROFF_SHIFT);
+-			value |= B43_DMA64_RXENABLE;
+ 			value |= (addrext << B43_DMA64_RXADDREXT_SHIFT)
+ 			    & B43_DMA64_RXADDREXT_MASK;
+ 			if (!parity)
+ 				value |= B43_DMA64_RXPARITYDISABLE;
++
++			/*
++			 * BCM4360: RX DMA burst 3, prefetch control 3 and
++			 * prefetch threshold 3.
++			 */
++			if (bcm4360_rx_late_arm) {
++				value |= (3 << B43_DMA64_RXBURST_SHIFT) &
++					 B43_DMA64_RXBURST_MASK;
++				value |= (3 << B43_DMA64_RXPREFCTL_SHIFT) &
++					 B43_DMA64_RXPREFCTL_MASK;
++				value |= (3 << B43_DMA64_RXPREFTHRESH_SHIFT) &
++					 B43_DMA64_RXPREFTHRESH_MASK;
++			}
++
++			if (!bcm4360_rx_late_arm)
++				value |= B43_DMA64_RXENABLE;
++
+ 			b43_dma_write(ring, B43_DMA64_RXCTL, value);
+ 			b43_dma_write(ring, B43_DMA64_RXRINGLO, addrlo);
+ 			b43_dma_write(ring, B43_DMA64_RXRINGHI, addrhi);
+-			b43_dma_write(ring, B43_DMA64_RXINDEX, ring->nr_slots *
+-				      sizeof(struct b43_dmadesc64));
++
++			if (bcm4360_rx_late_arm && ring->bcm4360_split_rx) {
++				u32 mask_probe;
++				u32 align_probe;
++				u32 ptr_mask;
++
++				/*
++				 * Probe the DMA64 descriptor-pointer layout:
++				 * write ~0 to the ring base.  If low
++				 * descriptor-address bits are implemented, the
++				 * current-descriptor mask is read back from the
++				 * index register; otherwise it is 0x1fff.
++				 */
++				b43_dma_write(ring, B43_DMA64_RXRINGLO,
++					      0xffffffff);
++				mask_probe = b43_dma_read(ring,
++							  B43_DMA64_RXRINGLO);
++
++				if (mask_probe & 0x00000fff)
++					ptr_mask = b43_dma_read(ring,
++								B43_DMA64_RXINDEX) |
++						   0x0000000f;
++				else
++					ptr_mask = B43_DMA64_RXSTATDPTR;
++
++				ring->bcm4360_rx_ptr_mask = ptr_mask;
++
++				/*
++				 * Descriptor alignment probe: write 0xff0 to the
++				 * ring base.  A non-zero readback means the ring
++				 * need not be 4 KiB aligned, and pointers are then
++				 * relative to the ring base (ptr_base).
++				 */
++				b43_dma_write(ring, B43_DMA64_RXRINGLO,
++					      0x00000ff0);
++				align_probe = b43_dma_read(ring,
++							   B43_DMA64_RXRINGLO);
++
++				ring->bcm4360_rx_aligndesc_4k =
++					(align_probe == 0);
++
++				if (!ring->bcm4360_rx_aligndesc_4k)
++					ring->bcm4360_rx_ptr_base =
++						((u32)ringbase) & ptr_mask;
++				else
++					ring->bcm4360_rx_ptr_base = 0;
++
++				/*
++				 * Probes temporarily used the descriptor base
++				 * register while RX was disabled. Restore the
++				 * real descriptor table before arming DMA.
++				 */
++				b43_dma_write(ring, B43_DMA64_RXRINGLO,
++					      addrlo);
++				b43_dma_write(ring, B43_DMA64_RXRINGHI,
++					      addrhi);
++			}
++
++			/*
++			 * BCM4360: posted descriptors are only published after
++			 * RX has been armed.  All other devices keep the
++			 * existing b43 order.
++			 */
++			if (!bcm4360_rx_late_arm)
++				b43_dma_write(ring, B43_DMA64_RXINDEX,
++					      ring->nr_slots *
++					      sizeof(struct b43_dmadesc64));
++
++			if (bcm4360_rx_late_arm) {
++				/* Flush the table/pointer writes before arming. */
++				(void)b43_dma_read(ring, B43_DMA64_RXRINGLO);
++				(void)b43_dma_read(ring, B43_DMA64_RXRINGHI);
++
++				b43_dma_write(ring, B43_DMA64_RXCTL,
++					      value | B43_DMA64_RXENABLE);
++
++				/* RX is armed; publish the posted descriptors. */
++				(void)b43_dma_read(ring, B43_DMA64_RXCTL);
++
++				ring->ops->set_current_rxslot(ring,
++							      ring->rx_posted_slots);
++			}
+ 		} else {
+ 			u32 ringbase = (u32) (ring->dmabase);
+ 			addrext = b43_dma_address(&ring->dev->dma, ringbase, B43_DMA_ADDR_EXT);
+@@ -782,7 +952,25 @@ static void free_all_descbuffers(struct b43_dmaring *ring)
+ 		/* get meta - ignore returned value */
+ 		ring->ops->idx2desc(ring, i, &meta);
+ 
+-		if (!meta->skb || b43_dma_ptr_is_poisoned(meta->skb)) {
++		/*
++		 * A partially posted RX ring deliberately has descriptor
++		 * capacity without an skb attached to every slot.
++		 *
++		 * Keep scanning the complete ring so teardown remains correct
++		 * if RX buffers later occupy non-contiguous positions, but do
++		 * not diagnose an unposted NULL RX slot as corruption.
++		 *
++		 * Generic b43 RX rings still post the complete capacity and
++		 * retain the original warning if an expected skb is missing.
++		 */
++		if (!meta->skb) {
++			if (!ring->tx &&
++			    ring->rx_posted_slots >= ring->nr_slots)
++				B43_WARN_ON(1);
++			continue;
++		}
++
++		if (b43_dma_ptr_is_poisoned(meta->skb)) {
+ 			B43_WARN_ON(!ring->tx);
+ 			continue;
+ 		}
+@@ -843,8 +1031,27 @@ struct b43_dmaring *b43_setup_dmaring(struct b43_wldev *dev,
+ 		goto out;
+ 
+ 	ring->nr_slots = B43_RXRING_SLOTS;
+-	if (for_tx)
++	ring->rx_posted_slots = B43_RXRING_SLOTS;
++
++	ring->rx_post_slot = 0;
++	ring->bcm4360_split_rx = false;
++	ring->bcm4360_rx_ptr_mask = 0;
++	ring->bcm4360_rx_ptr_base = 0;
++	ring->bcm4360_rx_aligndesc_4k = false;
++
++	if (for_tx) {
+ 		ring->nr_slots = B43_TXRING_SLOTS;
++		ring->rx_posted_slots = 0;
++	} else if (controller_index == 0 &&
++		   b43_bcm4360_rx_only(dev) &&
++		   dev->dev->core_rev == 42) {
++		ring->nr_slots = B43_BCM4360_RXRING_SLOTS;
++		ring->rx_posted_slots = B43_BCM4360_RXPOST_SLOTS;
++
++		ring->current_slot = 0;
++		ring->rx_post_slot = ring->rx_posted_slots;
++		ring->bcm4360_split_rx = true;
++	}
+ 
+ 	ring->meta = kcalloc(ring->nr_slots, sizeof(struct b43_dmadesc_meta),
+ 			     GFP_KERNEL);
+@@ -870,6 +1077,12 @@ struct b43_dmaring *b43_setup_dmaring(struct b43_wldev *dev,
+ 			case B43_FW_HDR_598:
+ 				ring->rx_buffersize = B43_DMA0_RX_FW598_BUFSIZE;
+ 				ring->frameoffset = B43_DMA0_RX_FW598_FO;
++
++				/* BCM4360 (D11 rev 42): RX frame offset 40. */
++				if (b43_bcm4360_rx_only(dev) &&
++				    dev->dev->core_rev == 42) {
++					ring->frameoffset = 40;
++				}
+ 				break;
+ 			case B43_FW_HDR_410:
+ 			case B43_FW_HDR_351:
+@@ -1049,6 +1262,57 @@ static bool b43_dma_translation_in_low_word(struct b43_wldev *dev,
+ 	return false;
+ }
+ 
++/*
++ * Initialize only DMA controller 0 receive path.
++ *
++ * This intentionally does not create or enable any TX DMA ring.
++ * It is used by the BCM4360 receive-only bring-up path.
++ */
++int b43_dma_init_rx_only(struct b43_wldev *dev)
++{
++	struct b43_dma *dma = &dev->dma;
++	enum b43_dmatype type = b43_engine_type(dev);
++	int err;
++
++	if (b43_using_pio_transfers(dev))
++		return -EOPNOTSUPP;
++
++	err = dma_set_mask_and_coherent(dev->dev->dma_dev, DMA_BIT_MASK(type));
++	if (err) {
++		b43err(dev->wl, "The machine/kernel does not support "
++		       "the required %u-bit DMA mask\n", type);
++		return err;
++	}
++
++	switch (dev->dev->bus_type) {
++#ifdef CPTCFG_B43_BCMA
++	case B43_BUS_BCMA:
++		dma->translation = bcma_core_dma_translation(dev->dev->bdev);
++		break;
++#endif
++#ifdef CPTCFG_B43_SSB
++	case B43_BUS_SSB:
++		dma->translation = ssb_dma_translation(dev->dev->sdev);
++		break;
++#endif
++	}
++
++	dma->translation_in_low =
++		b43_dma_translation_in_low_word(dev, type);
++
++	dma->parity = true;
++#ifdef CPTCFG_B43_BCMA
++	if (dev->dev->bus_type == B43_BUS_BCMA)
++		dma->parity = false;
++#endif
++
++	dma->rx_ring = b43_setup_dmaring(dev, 0, 0, type);
++	if (!dma->rx_ring)
++		return -ENOMEM;
++
++	return 0;
++}
++
+ int b43_dma_init(struct b43_wldev *dev)
+ {
+ 	struct b43_dma *dma = &dev->dma;
+@@ -1684,12 +1948,174 @@ void b43_dma_handle_rx_overflow(struct b43_dmaring *ring)
+ 	ring->ops->set_current_rxslot(ring, previous_slot);
+ }
+ 
++/*
++ * BCM4360 partially posted RX ring.
++ *
++ * Receive reclaim (RXin, ring->current_slot) and posting (RXout,
++ * ring->rx_post_slot) cursors are independent: the ring has 2048
++ * descriptors of capacity and 256 posted receive buffers.  Each
++ * consumed buffer is replaced by a new one at RXout.
++ *
++ * Other b43 devices keep the existing in-place refill model.
++ */
++static int
++b43_bcm4360_rx_one(struct b43_dmaring *ring, int src_slot)
++{
++	const struct b43_dma_ops *ops = ring->ops;
++	struct b43_dmadesc_generic *src_desc;
++	struct b43_dmadesc_generic *dst_desc;
++	struct b43_dmadesc_meta *src_meta;
++	struct b43_dmadesc_meta *dst_meta;
++	struct b43_rxhdr_fw4 *rxhdr;
++	struct sk_buff *skb;
++	dma_addr_t dmaaddr;
++	u16 len;
++	int dst_slot;
++	int err;
++
++	B43_WARN_ON(ring->tx);
++	B43_WARN_ON(!ring->bcm4360_split_rx);
++	B43_WARN_ON(ring->type != B43_DMA_64BIT);
++
++	src_desc = ops->idx2desc(ring, src_slot, &src_meta);
++
++	if (unlikely(!src_meta->skb ||
++		     b43_dma_ptr_is_poisoned(src_meta->skb))) {
++		b43err(ring->dev->wl,
++		       "BCM4360 RX: invalid source slot %d\n",
++		       src_slot);
++		return -EIO;
++	}
++
++	skb = src_meta->skb;
++	dmaaddr = src_meta->dmaaddr;
++
++	sync_descbuffer_for_cpu(ring, dmaaddr, ring->rx_buffersize);
++
++	rxhdr = (struct b43_rxhdr_fw4 *)skb->data;
++	len = le16_to_cpu(rxhdr->frame_len);
++
++	if (len == 0) {
++		int i = 0;
++
++		do {
++			udelay(2);
++			barrier();
++			len = le16_to_cpu(rxhdr->frame_len);
++		} while (len == 0 && i++ < 5);
++	}
++
++	dst_slot = ring->rx_post_slot;
++	dst_desc = ops->idx2desc(ring, dst_slot, &dst_meta);
++
++	/*
++	 * With 2048 descriptors and 256 posted buffers the receive window
++	 * occupies only part of the descriptor table, so RXout must always
++	 * point to an unowned descriptor.
++	 */
++	if (unlikely(dst_meta->skb)) {
++		b43err(ring->dev->wl,
++		       "BCM4360 RX: RXout slot %d still owned\n",
++		       dst_slot);
++		return -EBUSY;
++	}
++
++	/*
++	 * For a valid single-buffer frame, allocate its replacement at
++	 * RXout before releasing the consumed RXin buffer.
++	 */
++	if (likely(len != 0 &&
++		   !b43_rx_buffer_is_poisoned(ring, skb) &&
++		   len + ring->frameoffset <= ring->rx_buffersize)) {
++		err = setup_rx_descbuffer(ring, dst_desc, dst_meta,
++					  GFP_ATOMIC);
++		if (!err) {
++			src_meta->skb = NULL;
++			src_meta->dmaaddr = 0;
++			memset(src_desc, 0,
++			       sizeof(struct b43_dmadesc64));
++
++			unmap_descbuffer(ring, dmaaddr,
++					 ring->rx_buffersize, 0);
++
++			ring->rx_post_slot =
++				next_slot(ring, ring->rx_post_slot);
++
++			skb_put(skb, len + ring->frameoffset);
++			skb_pull(skb, ring->frameoffset);
++			b43_rx(ring->dev, skb, rxhdr);
++
++			return 0;
++		}
++	}
++
++	/*
++	 * Invalid/poisoned/oversized frame, or replacement-allocation
++	 * failure: drop the frame but keep the number of posted buffers
++	 * by moving the existing mapped buffer from RXin to RXout.
++	 */
++	b43_poison_rx_buffer(ring, skb);
++	sync_descbuffer_for_device(ring, dmaaddr,
++				   ring->rx_buffersize);
++
++	dst_meta->skb = skb;
++	dst_meta->dmaaddr = dmaaddr;
++
++	ops->fill_descriptor(ring, dst_desc, dmaaddr,
++			     ring->rx_buffersize, 0, 0, 0);
++
++	src_meta->skb = NULL;
++	src_meta->dmaaddr = 0;
++	memset(src_desc, 0, sizeof(struct b43_dmadesc64));
++
++	ring->rx_post_slot =
++		next_slot(ring, ring->rx_post_slot);
++
++	return 0;
++}
++
++static void b43_bcm4360_dma_rx(struct b43_dmaring *ring)
++{
++	const struct b43_dma_ops *ops = ring->ops;
++	int current_slot;
++	int slot;
++	int err;
++
++	current_slot = ops->get_current_rxslot(ring);
++	B43_WARN_ON(!(current_slot >= 0 &&
++		      current_slot < ring->nr_slots));
++
++	slot = ring->current_slot;
++
++	while (slot != current_slot) {
++		err = b43_bcm4360_rx_one(ring, slot);
++		if (unlikely(err)) {
++			b43err(ring->dev->wl,
++			       "BCM4360 RX stalled: rxin=%d rxout=%d hw=%d err=%d\n",
++			       slot, ring->rx_post_slot, current_slot, err);
++			break;
++		}
++
++		slot = next_slot(ring, slot);
++	}
++
++	/* Publish only descriptors already fully prepared at RXout. */
++	wmb();
++	ops->set_current_rxslot(ring, ring->rx_post_slot);
++	ring->current_slot = slot;
++}
++
+ void b43_dma_rx(struct b43_dmaring *ring)
+ {
+ 	const struct b43_dma_ops *ops = ring->ops;
+ 	int slot, current_slot;
+ 	int used_slots = 0;
+ 
++	if (unlikely(ring->bcm4360_split_rx)) {
++		b43_bcm4360_dma_rx(ring);
++		return;
++	}
++
+ 	B43_WARN_ON(ring->tx);
+ 	current_slot = ops->get_current_rxslot(ring);
+ 	B43_WARN_ON(!(current_slot >= 0 && current_slot < ring->nr_slots));
+--- a/drivers/net/wireless/broadcom/b43/dma.h
++++ b/drivers/net/wireless/broadcom/b43/dma.h
+@@ -118,6 +118,12 @@ struct b43_dmadesc32 {
+ #define		B43_DMA64_RXPARITYDISABLE		0x00000800
+ #define		B43_DMA64_RXADDREXT_MASK		0x00030000
+ #define		B43_DMA64_RXADDREXT_SHIFT		16
++#define		B43_DMA64_RXBURST_MASK		0x001C0000
++#define		B43_DMA64_RXBURST_SHIFT		18
++#define		B43_DMA64_RXPREFCTL_MASK		0x00E00000
++#define		B43_DMA64_RXPREFCTL_SHIFT		21
++#define		B43_DMA64_RXPREFTHRESH_MASK		0x03000000
++#define		B43_DMA64_RXPREFTHRESH_SHIFT		24
+ #define B43_DMA64_RXINDEX				0x24
+ #define B43_DMA64_RXRINGLO				0x28
+ #define B43_DMA64_RXRINGHI				0x2C
+@@ -171,6 +177,13 @@ struct b43_dmadesc_generic {
+ /* DMA engine tuning knobs */
+ #define B43_TXRING_SLOTS		256
+ #define B43_RXRING_SLOTS		32
++
++/*
++ * BCM4360 RX ring: 2048 descriptors of capacity (32 KiB of DMA64
++ * descriptors) with 256 receive buffers posted.
++ */
++#define B43_BCM4360_RXRING_SLOTS	2048
++#define B43_BCM4360_RXPOST_SLOTS	256
+ #define B43_DMA0_RX_FW598_BUFSIZE	(B43_DMA0_RX_FW598_FO + IEEE80211_MAX_FRAME_LEN)
+ #define B43_DMA0_RX_FW351_BUFSIZE	(B43_DMA0_RX_FW351_FO + IEEE80211_MAX_FRAME_LEN)
+ 
+@@ -239,6 +252,27 @@ struct b43_dmaring {
+ 	dma_addr_t dmabase;
+ 	/* Number of descriptor slots in the ring. */
+ 	int nr_slots;
++
++	/*
++	 * Number of RX descriptors initially published to hardware.
++	 * Generic b43 keeps this equal to nr_slots.
++	 */
++	int rx_posted_slots;
++
++	/*
++	 * RX producer cursor for partially posted receive rings.
++	 *
++	 * For the BCM4360 split RX ring, current_slot is the
++	 * reclaim/RXin cursor and rx_post_slot is the independent
++	 * post/RXout cursor.
++	 */
++	int rx_post_slot;
++	bool bcm4360_split_rx;
++
++	/* BCM4360 DMA64 descriptor-pointer layout (probed at ring setup). */
++	u32 bcm4360_rx_ptr_mask;
++	u32 bcm4360_rx_ptr_base;
++	bool bcm4360_rx_aligndesc_4k;
+ 	/* Number of used descriptor slots. */
+ 	int used_slots;
+ 	/* Currently used slot in the ring. */
+@@ -285,6 +319,7 @@ static inline void b43_dma_write(struct b43_dmaring *ring, u16 offset, u32 value
+ 	b43_write32(ring->dev, ring->mmio_base + offset, value);
+ }
+ 
++int b43_dma_init_rx_only(struct b43_wldev *dev);
+ int b43_dma_init(struct b43_wldev *dev);
+ void b43_dma_free(struct b43_wldev *dev);
+ 
