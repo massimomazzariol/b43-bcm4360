@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Write a BCM4360 data package (ABI version 1) from a JSON description.
 
 Test tooling for the b43 BCM4360 data loader (bcm4360_data_fw.c).  The

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Host tests for the b43 BCM4360 data loader.
 
 Generates synthetic data packages (test identity chip 0x0001 / radio

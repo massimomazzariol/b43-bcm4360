@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Write the files a patch creates (--- /dev/null hunks) into a directory.
 
 usage: new-files-from-patch.py <outdir> <patch>...

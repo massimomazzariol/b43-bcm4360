@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Host test of the BCM4360 hardware-data loader, built from the loader
 # source contained in the patch series (no kernel tree needed).

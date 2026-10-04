@@ -9,7 +9,7 @@ the BCM4360 hardware data set (bcm4360.h).
 --- /dev/null
 +++ b/drivers/net/wireless/broadcom/b43/radio_2069.c
 @@ -0,0 +1,667 @@
-+// SPDX-License-Identifier: GPL-2.0-only
++// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Broadcom B43 wireless driver
 + * Broadcom 2069 radio support (revision 4, 2.4 GHz)
@@ -679,7 +679,7 @@ the BCM4360 hardware data set (bcm4360.h).
 --- /dev/null
 +++ b/drivers/net/wireless/broadcom/b43/radio_2069.h
 @@ -0,0 +1,22 @@
-+/* SPDX-License-Identifier: GPL-2.0-only */
++/* SPDX-License-Identifier: GPL-2.0-or-later */
 +#ifndef B43_RADIO_2069_H_
 +#define B43_RADIO_2069_H_
 +

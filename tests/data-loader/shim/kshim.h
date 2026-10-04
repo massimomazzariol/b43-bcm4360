@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Minimal user-space stand-ins for the kernel APIs used by bcm4360_data_fw.c. */
 #ifndef KSHIM_H
 #define KSHIM_H

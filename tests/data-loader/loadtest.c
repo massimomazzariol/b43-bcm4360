@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Host test for the b43 BCM4360 data loader (bcm4360_data_fw.c).
  *

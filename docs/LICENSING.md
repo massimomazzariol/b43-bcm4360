@@ -7,16 +7,16 @@ SPDX tag of each file is authoritative.
 
 ## Summary
 
-- **Repository default: GPL-2.0-only.**  Applies to every file in this
-  repository that has no SPDX tag of its own (documentation, patch
-  headers).
+- **Project's own work: GPL-2.0-or-later.**  New driver files, tools,
+  tests, documentation and patch headers written for this project.  "Or
+  later" keeps them usable in GPL-3.0 projects too.
 - **Driver code**: each file created or modified by the patches keeps
   the license of the file it belongs to — GPL-2.0-or-later or
   GPL-2.0-only (`GPL-2.0` in older SPDX notation) as tagged.  The b43
   module as a whole is distributed under GPL-2.0 (the module declares
   `MODULE_LICENSE("GPL")`).
 - **OpenWrt packaging patch**: GPL-2.0-only, the license of OpenWrt.
-- **Tools and tests**: GPL-2.0-only.
+- **Tools and tests**: GPL-2.0-or-later.
 - **No third-party code** other than Linux b43 and OpenWrt is included.
   No hardware data and no firmware are included.
 
@@ -42,9 +42,9 @@ as shipped in backports 6.18.26; **new** = file created by this project.
 | Patch | File(s) in b43 | Origin | License (SPDX) | Attribution required | Notes |
 |---|---|---|---|---|---|
 | 820 | `xmit.c` | Linux b43, upstream fix | GPL-2.0-or-later | Tristan Madani (author), upstream Linux commit 1f4f78bf8549 | backport, unchanged |
-| 900 | `radio_2069.c`, `radio_2069.h` | new | GPL-2.0-only | Massimo Mazzariol | |
+| 900 | `radio_2069.c`, `radio_2069.h` | new | GPL-2.0-or-later | Massimo Mazzariol | |
 | 901 | `tables_phy_ac.c` | new | GPL-2.0-or-later | Massimo Mazzariol | |
-| 901 | `tables_phy_ac.h` | new | GPL-2.0 (only) | – | |
+| 901 | `tables_phy_ac.h` | new | GPL-2.0-or-later | Massimo Mazzariol | |
 | 902 | `phy_ac.c` | Linux b43, modified | GPL-2.0-or-later | Rafał Miłecki (original), Massimo Mazzariol (additions) | both copyright notices kept |
 | 902 | `phy_ac.h` | Linux b43, modified | GPL-2.0 (only) | b43 authors | |
 | 902 | `bcm4360.h` | new | GPL-2.0-or-later | Massimo Mazzariol | |
@@ -71,15 +71,15 @@ its context lines are upstream b43 code under that file's license.
 
 | Path | Origin | License | Notes |
 |---|---|---|---|
-| `tools/apply-to-openwrt.sh` | new | GPL-2.0-only | |
-| `tools/passive-scan-check.sh` | new | GPL-2.0-only | runs on the router |
-| `tests/data-loader/*` | new | GPL-2.0-only | builds `bcm4360_data_fw.c` from patch 905 with user-space stand-ins for kernel APIs (`shim/`); generates synthetic test data only |
+| `tools/apply-to-openwrt.sh` | new | GPL-2.0-or-later | |
+| `tools/passive-scan-check.sh` | new | GPL-2.0-or-later | runs on the router |
+| `tests/data-loader/*` | new | GPL-2.0-or-later | builds `bcm4360_data_fw.c` from patch 905 with user-space stand-ins for kernel APIs (`shim/`); generates synthetic test data only |
 
 ### Documentation
 
 | Path | Origin | License |
 |---|---|---|
-| `README.md`, `docs/*.md` | new | GPL-2.0-only |
+| `README.md`, `docs/*.md` | new | GPL-2.0-or-later |
 | `LICENSES/*` | FSF license texts | verbatim, unmodified |
 
 ## Image assets
@@ -92,7 +92,7 @@ documentation assets.
 
 The external ASUS RT-AC68U photograph is a derivative of a Wikimedia
 Commons image licensed under CC BY-SA 2.0. That image retains its
-Creative Commons license and is not relicensed under GPL-2.0-only.
+Creative Commons license and is not relicensed under the GPL.
 
 ## Not included
 

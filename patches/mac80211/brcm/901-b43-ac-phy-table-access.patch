@@ -91,7 +91,7 @@ tables of the BCM4360 hardware data set.
 --- /dev/null
 +++ b/drivers/net/wireless/broadcom/b43/tables_phy_ac.h
 @@ -0,0 +1,15 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
++/* SPDX-License-Identifier: GPL-2.0-or-later */
 +#ifndef B43_TABLES_PHY_AC_H_
 +#define B43_TABLES_PHY_AC_H_
 +

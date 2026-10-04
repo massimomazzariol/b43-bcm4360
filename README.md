@@ -570,17 +570,18 @@ in:
 
 ## License
 
-Repository default:
+Everything here is free software: use it, change it, share it.
 
-**GNU General Public License v2.0 only (GPL-2.0-only)**
-
-Copyright 2026 Massimo Mazzariol. Free to use, modify and share under the GPL.
-
-Files inherited from or modifying Linux b43 retain the licenses indicated
-by their SPDX identifiers, including GPL-2.0-or-later where applicable.
-
-No third-party experimental AC-PHY code, proprietary firmware or
-hardware-data payloads are distributed by this repository.
+- **This project's own work** (new driver files, tools, tests, docs):
+  GPL-2.0-or-later, Copyright 2026 Massimo Mazzariol.
+- **Linux b43 and OpenWrt code** in the patches keeps its original
+  license (GPL-2.0-or-later or GPL-2.0-only, per SPDX tag) and the
+  copyright of its authors: Michael Buesch, Rafał Miłecki, Martin
+  Langer, Stefano Brivio, Danny van Dyk, Andreas Jaggi and the other
+  b43 and OpenWrt contributors. Nothing is relicensed.
+- No third-party AC-PHY code, proprietary firmware or hardware-data
+  payloads are distributed. Alessio Ferri's b43-ac-wip is acknowledged
+  as prior work and was used only as a technical reference.
 
 See:
 
