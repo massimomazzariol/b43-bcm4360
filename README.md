@@ -572,7 +572,9 @@ in:
 
 Repository default:
 
-**GNU General Public License v2.0 only — GPL-2.0-only**
+**GNU General Public License v2.0 only (GPL-2.0-only)**
+
+Copyright 2026 Massimo Mazzariol, [https://github.com/massimomazzariol/b43-bcm4360](https://github.com/massimomazzariol/b43-bcm4360). If you reuse this work, keep the copyright notices and the [NOTICE](NOTICE) file.
 
 Files inherited from or modifying Linux b43 retain the licenses indicated
 by their SPDX identifiers, including GPL-2.0-or-later where applicable.
