@@ -28,7 +28,7 @@ association and 5 GHz operation remain disabled.
 <img width="1122" height="1080" alt="rt-ac68u-router" src="docs/images/rt-ac68u-router.jpg" />
 
 <p align="center">
-  <em>ASUS RT-AC68U — the hardware platform used for development and validation.</em>
+  <em>ASUS RT-AC68U - the hardware platform used for development and validation.</em>
 </p>
 
 > [!IMPORTANT]
@@ -42,7 +42,7 @@ association and 5 GHz operation remain disabled.
 
 | | |
 |---|---|
-| **Tested hardware** | ASUS RT-AC68U — BCM4360 D11 core rev 42, AC-PHY rev 1, BCM2069 rev 4, 2.4 GHz device |
+| **Tested hardware** | ASUS RT-AC68U - BCM4360 D11 core rev 42, AC-PHY rev 1, BCM2069 rev 4, 2.4 GHz device |
 | **Tested software** | OpenWrt 25.12.5 · Linux 6.12.94 · mac80211 backports 6.18.26 · b43 microcode 784.2 |
 | **Working** | module probe and attach · 2.4 GHz receive path · mac80211/cfg80211 integration · passive scanning · BSS reception · channel and signal reporting |
 | **Intentionally disabled** | transmission · active scanning · association · connectivity · AP/mesh/ad-hoc · 5 GHz · 40/80 MHz |
@@ -187,7 +187,7 @@ On the tested ASUS RT-AC68U:
   rejected;
 - one wiphy is registered;
 - `managed` and `monitor` interface modes are available;
-- channels 1–14 are exposed;
+- channels 1-14 are exposed;
 - every exposed channel is marked `NO_IR`;
 - no 5 GHz channels are exposed;
 - standard Linux wireless tooling can perform passive scans;
@@ -595,7 +595,7 @@ See:
 
 Current public release:
 
-**[v0.1.0 — BCM4360 receive support for b43/OpenWrt](https://github.com/massimomazzariol/b43-bcm4360/releases/tag/v0.1.0)**
+**[v0.1.0 - BCM4360 receive support for b43/OpenWrt](https://github.com/massimomazzariol/b43-bcm4360/releases/tag/v0.1.0)**
 
 The v0.1.0 milestone is intentionally limited to a hardware-validated
 2.4 GHz receive path.

@@ -11,7 +11,7 @@ SPDX tag of each file is authoritative.
   tests, documentation and patch headers written for this project.  "Or
   later" keeps them usable in GPL-3.0 projects too.
 - **Driver code**: each file created or modified by the patches keeps
-  the license of the file it belongs to — GPL-2.0-or-later or
+  the license of the file it belongs to - GPL-2.0-or-later or
   GPL-2.0-only (`GPL-2.0` in older SPDX notation) as tagged.  The b43
   module as a whole is distributed under GPL-2.0 (the module declares
   `MODULE_LICENSE("GPL")`).

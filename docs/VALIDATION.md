@@ -2,9 +2,9 @@
 
 Two different things are validated, and they are reported separately:
 
-- **A. Source build validation** — the published patch series builds
+- **A. Source build validation** - the published patch series builds
   without any hardware data.
-- **B. Hardware functional validation** — with the required hardware
+- **B. Hardware functional validation** - with the required hardware
   data supplied locally, the driver receives on the tested router.
 
 Network identities in all examples below are synthetic.  Raw logs are not
